@@ -8,3 +8,7 @@ __pycache__/
 # 启动脚本产生的运行日志
 server.log
 server.err
+
+# 其他 AI 工具在本目录留下的本地状态（附件/任务/记忆），与项目无关
+.reasonix/
+.workbuddy/
