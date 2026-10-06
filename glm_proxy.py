@@ -823,6 +823,8 @@ class StreamAccumulator:
         self._emitted_parts: set[str] = set()         # 已经吐过内容的 part（用于加分隔）
         self.rewrites = 0                             # 快照与已收分片不连续的次数（仅日志）
         self.rescued = 0                              # 终态补齐次数（接缝处会有少量重复）
+        self.platform_tools: list[str] = []           # 上游平台自带工具名，只记录不回传
+        self._seen_tools: set[tuple[str, str]] = set()
         self._final = False
         self._warned = False
         self._rescue_warned = False
@@ -836,9 +838,17 @@ class StreamAccumulator:
             for part in parts:
                 if not isinstance(part, dict) or not part.get("logic_id"):
                     continue
+                logic_id = str(part["logic_id"])
                 if part.get("model"):
                     self.served_model = str(part["model"])
-                self._absorb(str(part["logic_id"]), _render_part(part))
+                for name in _platform_tool_calls(part):
+                    if (logic_id, name) in self._seen_tools:
+                        continue
+                    self._seen_tools.add((logic_id, name))
+                    self.platform_tools.append(name)
+                    log(f"[upstream] 平台自带工具 {name} 被调用了："
+                        "上游自己执行并把结果用于作答，不会回传给客户端")
+                self._absorb(logic_id, _render_part(part))
 
         return self._flush(str(event.get("status")) in ("finish", "intervene"))
 
@@ -949,6 +959,28 @@ def _render_part(part: dict) -> tuple[str, str]:
                 if isinstance(img, dict) and img.get("image_url"):
                     texts.append(f"![image]({img['image_url']})")
     return "\n".join(x for x in texts if x), "\n".join(x for x in reasonings if x)
+
+
+def _platform_tool_calls(part: dict) -> list[str]:
+    """上游**平台自带工具**（search / 沙箱执行等）在这一个 part 里的调用名。
+
+    形状（抓帧实测）：``{"type":"tool_calls","tool_calls":{"id","name","arguments"}}``，
+    后面还会跟一个 ``type=="tool_result"`` 的 item —— 说明上游已经自己把工具跑完了。
+
+    ⚠ 只记录、**绝不翻译成客户端的 tool_calls**：这些工具不在客户端声明的 ``tools`` 里，
+    客户端也没有它们的实现，回传会让客户端去执行一个不存在的工具并卡在等结果。
+    """
+    names = []
+    for item in part.get("content") or []:
+        if not isinstance(item, dict) or item.get("type") != "tool_calls":
+            continue
+        call = item.get("tool_calls")
+        if not isinstance(call, dict):
+            continue
+        name = str(call.get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
 
 
 # ─────────────────────────── 上游调用 ───────────────────────────
@@ -1144,13 +1176,54 @@ def _loads_first_json(text: str, start: int) -> dict | None:
             return obj if isinstance(obj, dict) else None
     # 末路兜底：括号失配（上游多吐闭合括号，位置还不定），配平后再解析。
     repaired = _repair_balanced_json(text, start)
-    if not repaired:
-        return None
-    try:
-        obj = json.loads(repaired)
-    except json.JSONDecodeError:
-        return None
-    return obj if isinstance(obj, dict) else None
+    if repaired:
+        try:
+            obj = json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(obj, dict):
+                return obj
+    # 还是不行 → 大概率是「字符串里的引号没转义」，见 _loads_with_inner_quote_fix。
+    return _loads_with_inner_quote_fix(text, start)
+
+
+INNER_QUOTE_FIX_MAX = 1500
+
+
+def _loads_with_inner_quote_fix(text: str, start: int) -> dict | None:
+    """专治「参数里写代码、内层双引号没转义」的输出（实测 ``mcp__CherryHub__exec``）。
+
+    模型经常这样吐（``code`` 的值里全是裸 ``"``，整段 JSON 因此非法，括号倒是配平的，
+    ``_repair_balanced_json`` 也帮不上）：
+    ``{"tool_calls":[{"name":"...","arguments":{"code":"mcp.callTool("tavily", { q: "北京" })"}}]}``
+    于是这一整坨会退化成普通回答 —— 用户看到的就是一段本该被执行的 JSON。
+
+    修法只有一招：JSON 扫描器每**误认一个字符串结尾**，就会在紧随其后报一个语法错，
+    那就把「它刚误用的那个引号」补成 ``\\"`` 再重来。这样字符串只会往后延伸，
+    误判点严格递增（``quote > last_fix`` 既是正确性要求也是防死循环），必然收敛。
+
+    顺带用 ``strict=False``：模型还常把换行/制表直接写进字符串（该是 ``\\n`` 的写成真空行），
+    严格模式会报 ``Invalid control character``，``strict=False`` 原样收下即可。
+
+    安全性靠后面两道关卡兜：调用形状必须对、工具名必须在客户端声明的名单里，
+    否则照样退化成普通回答 —— 不会因为「能解析」就硬给一个错调用。
+    """
+    decoder = json.JSONDecoder(strict=False)
+    current = text
+    last_fix = start
+    for _ in range(INNER_QUOTE_FIX_MAX):
+        try:
+            obj, _ = decoder.raw_decode(current, start)
+        except json.JSONDecodeError as exc:
+            quote = current.rfind('"', start, exc.pos)
+            if quote <= last_fix or current[quote - 1] == "\\":
+                return None                       # 不是「误认的结尾引号」，别再猜了
+            current = current[:quote] + "\\" + current[quote:]
+            last_fix = quote
+            continue
+        return obj if isinstance(obj, dict) else None
+    return None
 
 
 def _json_candidates(text: str, start: int):

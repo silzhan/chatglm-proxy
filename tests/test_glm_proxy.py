@@ -90,6 +90,34 @@ def sse_with_think_only(thinking: str) -> str:
     ) % json.dumps(thinking, ensure_ascii=False)
 
 
+def sse_with_native_tool_call(tool_name: str, answer: str) -> str:
+    """造一段「上游调用了**平台自带工具**（search 等），随后自己把结果用于作答」的 SSE。
+
+    item 形状与 arguments 都是 JSON 字符串 —— 与抓帧实测的 chatglm.cn 网页版一致。
+    """
+    call = json.dumps({
+        "type": "tool_calls",
+        "tool_calls": {
+            "id": "call_0123456789abcdef",
+            "name": tool_name,
+            "arguments": json.dumps({"query": "北京 天气"}, ensure_ascii=False),
+        },
+    }, ensure_ascii=False)
+    result = json.dumps({
+        "type": "tool_result",
+        "tool_result": {"id": "call_0123456789abcdef", "content": "北京 晴 21 度"},
+    }, ensure_ascii=False)
+    text = json.dumps({"type": "text", "text": answer}, ensure_ascii=False)
+    return (
+        'data: {"conversation_id":"conv-1","parts":[{"logic_id":"p1","content":[%s]}],'
+        '"status":"generating"}\n\n'
+        'data: {"conversation_id":"conv-1","parts":[{"logic_id":"p1","content":[%s,%s]}],'
+        '"status":"generating"}\n\n'
+        'data: {"conversation_id":"conv-1","parts":[{"logic_id":"p1","content":[%s]}],'
+        '"status":"finish"}\n\n'
+    ) % (call, call, result, text)
+
+
 @contextmanager
 def env_patch(env: dict):
     """临时替换 GLM_*/HOST/PORT/SERVER_API_KEYS 环境变量，退出时完全还原。"""
@@ -633,6 +661,52 @@ class StreamAccumulatorTest(unittest.TestCase):
         self.assertEqual(acc.full_text(), "第一段第二段第三段")
         self.assertEqual(acc.finalize()[0], "")
 
+    def test_platform_tool_call_is_recorded_not_leaked(self):
+        """上游平台自带工具（search 等）：记账，但绝不进正文、也不变成客户端的 tool_calls。
+
+        抓帧实测：``{"type":"tool_calls","tool_calls":{"id","name","arguments"}}``，
+        紧跟一个 ``tool_result`` —— 上游已经自己跑完了，客户端无从执行。
+        """
+        part = {
+            "logic_id": "p1",
+            "content": [
+                {"type": "tool_calls", "tool_calls": {
+                    "id": "call-1", "name": "search",
+                    "arguments": '{"query": "北京 天气"}'}},
+                {"type": "tool_result", "tool_result": {"id": "call-1", "content": "晴 21 度"}},
+                {"type": "text", "text": "北京今天晴，21 度。"},
+            ],
+        }
+        acc = gp.StreamAccumulator()
+        event = {"conversation_id": "c1", "status": "generating", "parts": [part]}
+        text, reasoning = acc.consume(event)
+        self.assertEqual(acc.platform_tools, ["search"])
+        self.assertEqual(text, "北京今天晴，21 度。")
+        self.assertEqual(reasoning, "")
+        self.assertNotIn("tool_calls", acc.full_text())
+        self.assertNotIn("search", acc.full_text())
+
+    def test_platform_tool_call_logged_once_per_part(self):
+        """同一帧被重复推（上游常态）：同一个 part 的同一个工具只记一次。"""
+        part = {
+            "logic_id": "p1",
+            "content": [{"type": "tool_calls", "tool_calls": {"name": "sandbox",
+                                                              "arguments": "{}"}}],
+        }
+        event = {"conversation_id": "c1", "status": "generating", "parts": [part]}
+        acc = gp.StreamAccumulator()
+        for _ in range(3):
+            acc.consume(event)
+        self.assertEqual(acc.platform_tools, ["sandbox"])
+
+    def test_platform_tool_call_without_name_is_ignored(self):
+        """形状对不上（没有 name）就什么都不记，也别把 JSON 漏进正文。"""
+        part = {"logic_id": "p1", "content": [{"type": "tool_calls", "tool_calls": {}}]}
+        acc = gp.StreamAccumulator()
+        acc.consume({"conversation_id": "c1", "status": "finish", "parts": [part]})
+        self.assertEqual(acc.platform_tools, [])
+        self.assertEqual(acc.full_text(), "")
+
     def test_normal_incremental_streaming(self):
         """每帧都推完整累积值（快照式）：新增的尾巴立刻发出，边生边出。"""
         acc = gp.StreamAccumulator()
@@ -1005,6 +1079,34 @@ class HttpEndToEndTest(FakeUpstreamCase):
         self.assertEqual(last["choices"][0]["delta"], {})
         self.assertEqual(last["choices"][0]["finish_reason"], "stop")
         self.assertTrue(raw.rstrip().endswith("data: [DONE]"))
+
+    def test_stream_does_not_leak_platform_tool_call(self):
+        """上游自己跑了平台工具（search）时，客户端只会看到普通正文。
+
+        平台工具不在客户端声明的 tools 里、客户端也没有实现；回传 tool_calls 会让
+        客户端去执行一个不存在的工具并卡在等结果。
+        """
+        self.fake.script = [("sse", sse_with_native_tool_call("search", "北京今天晴，21 度。"))]
+        raw = self.post_raw({"model": "glm-4", "stream": True, "messages": [BUSY_REQUEST]})
+        payloads = [
+            json.loads(line[6:]) for line in raw.splitlines()
+            if line.startswith("data: ") and line[6:].strip() != "[DONE]"
+        ]
+        self.assertFalse([p for p in payloads if p["choices"][0]["delta"].get("tool_calls")])
+        self.assertEqual("".join(p["choices"][0]["delta"].get("content") or ""
+                                 for p in payloads), "北京今天晴，21 度。")
+        self.assertEqual(payloads[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_platform_tool_call_in_tools_mode_stays_a_plain_answer(self):
+        """带 tools 的请求也一样：平台工具不构成 tool_calls，直接当回答返回。"""
+        self.fake.script = [("sse", sse_with_native_tool_call("search", "北京今天晴，21 度。"))]
+        status, data = self.post_json({
+            "model": "glm-4", "messages": [BUSY_REQUEST], "tools": [WEATHER_TOOL]
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(data["choices"][0]["finish_reason"], "stop")
+        self.assertIsNone(data["choices"][0]["message"].get("tool_calls"))
+        self.assertEqual(data["choices"][0]["message"]["content"], "北京今天晴，21 度。")
 
     def _stream_content(self, raw: str) -> str:
         frames = [json.loads(line[6:]) for line in raw.splitlines()
@@ -1910,6 +2012,82 @@ class TruncatedJsonRescueTest(unittest.TestCase):
         """基准：完整 JSON 解析正常。"""
         calls = gp.parse_tool_calls(self.FULL, self.TOOLS)
         self.assertEqual(len(calls), 2)
+
+
+class UnescapedQuoteJsonTest(unittest.TestCase):
+    """参数里写代码、内层双引号没转义时的 JSON 修复。
+
+    实测故障：Cherry Studio 的 ``mcp__CherryHub__exec``，模型把 JS 代码塞进 ``code``，
+    代码里的 ``"tavilyMcpTavilySearch"`` 这类引号全是裸的 —— 整段 JSON 非法（括号倒是配平的，
+    截断抢救帮不上），于是本该执行的工具调用被当成普通回答，用户看到一坨裸 JSON。
+    """
+
+    CODE = (
+        "const [a, b, c] = await parallel(\n"
+        '  mcp.callTool("tavilyMcpTavilySearch", { query: "北京 景区 今日 客流", '
+        'time_range: "day", max_results: 8, search_depth: "advanced" }),\n'
+        '  mcp.callTool("tavilyMcpTavilySearch", { query: "北京 热门景点 客流 故宫", '
+        'time_range: "day", max_results: 8 }),\n'
+        ");\nreturn { todayFlow: a, hotspots: b, news: c };"
+    )
+    TOOLS = {"mcp__CherryHub__exec"}
+
+    def body(self, code: str, wrapped: bool = True) -> str:
+        inner = ('{"tool_calls":[{"name":"mcp__CherryHub__exec","arguments":'
+                 '{"code":"' + code + '"}}]}')
+        return inner if wrapped else '{"name":"mcp__CherryHub__exec","arguments":{"code":"' + code + '"}}'
+
+    def test_plain_json_rejects_it_first(self):
+        """先确认这段确实非法 —— 否则整个测试场景就是假的。"""
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(self.body(self.CODE.replace("\n", "\\n")))
+
+    def test_unescaped_quotes_are_repaired_and_code_survives(self):
+        """修复后必须拿到调用，且 code **逐字**不变（引号、换行都还原）。"""
+        calls = gp.parse_tool_calls(self.body(self.CODE.replace("\n", "\\n")), self.TOOLS)
+        self.assertIsNotNone(calls)
+        self.assertEqual(len(calls), 1)
+        code = json.loads(calls[0]["function"]["arguments"])["code"]
+        self.assertEqual(code, self.CODE)
+        self.assertEqual(code.count("callTool"), 2)
+
+    def test_single_call_shape_also_repairs(self):
+        """``{"name":..,"arguments":..}`` 这种不带 tool_calls 数组的写法同样能救。"""
+        calls = gp.parse_tool_calls(self.body(self.CODE.replace("\n", "\\n"), wrapped=False),
+                                    self.TOOLS)
+        self.assertEqual([c["function"]["name"] for c in calls or []], ["mcp__CherryHub__exec"])
+
+    def test_raw_newlines_inside_the_value_are_tolerated(self):
+        """另一种常见写法：该转成 \\n 的换行直接给真空行（strict 模式会报控制字符错）。"""
+        calls = gp.parse_tool_calls(self.body(self.CODE), self.TOOLS)
+        self.assertIsNotNone(calls)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["code"], self.CODE)
+
+    def test_unknown_tool_name_still_refuses_the_repair(self):
+        """修不修得动是一回事，工具名不在客户端名单里就必须拒绝 —— 不许硬给一个调用。"""
+        self.assertIsNone(gp.parse_tool_calls(
+            self.body(self.CODE.replace("\n", "\\n")), {"other_tool"}))
+
+    def test_properly_escaped_output_is_untouched(self):
+        """基准：本来就合法的 JSON 走原路径，不该被修复逻辑改动。"""
+        good = json.dumps({"tool_calls": [{"name": "mcp__CherryHub__exec",
+                                          "arguments": {"code": self.CODE}}]},
+                          ensure_ascii=False)
+        calls = gp.parse_tool_calls(good, self.TOOLS)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["code"], self.CODE)
+
+    def test_plain_answer_is_not_mistaken_for_a_call(self):
+        """普通回答（含引号、含大括号）不能被误判成工具调用。"""
+        for text in ("北京今天晴，21 度。", '{"note":"这不是工具调用"}',
+                     '他说："调用 inspect({ name: "x" }) 就行"'):
+            self.assertIsNone(gp.parse_tool_calls(text, self.TOOLS), msg=text)
+
+    def test_pathological_input_terminates(self):
+        """极端输入（一长串裸引号）必须很快放弃，而不是把请求线程卡住。"""
+        started = time.time()
+        self.assertIsNone(gp.parse_tool_calls('{"name":"x","arguments":{"code":' + '""' * 400,
+                                              {"x"}))
+        self.assertLess(time.time() - started, 2.0)
 
 
 class ToolMissLogTest(unittest.TestCase):
