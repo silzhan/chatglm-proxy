@@ -253,10 +253,17 @@ class Config:
 
         # 工具结果体积治理：回灌给上游时裁剪，防止网页垃圾撑爆上下文（见 clamp_tool_result）
         self.clamp_tool_result = env_bool("GLM_CLAMP_TOOL_RESULT", True)
+        # 上游 agent 每一步都会产出一个 part，全拼进正文就会把
+        # 「我再进一步查找…」这类过程旁白当答案发给客户端（实测污染过 950 字答案）。
+        self.strip_process_narration = env_bool("GLM_STRIP_PROCESS_NARRATION", True)
         self.tool_result_max_chars = int(os.environ.get("GLM_TOOL_RESULT_MAX_CHARS", "8000") or 8000)
         self.tool_result_total_max_chars = int(
             os.environ.get("GLM_TOOL_RESULT_TOTAL_MAX_CHARS", "20000") or 20000)
         self.web_result_max_chars = int(os.environ.get("GLM_WEB_RESULT_MAX_CHARS", "4000") or 4000)
+        # 工具定义体积上限（见 TOOLS_PROMPT_MAX_CHARS）；留空取默认，显式写 0 = 不裁剪
+        raw_tools_budget = os.environ.get("GLM_TOOLS_PROMPT_MAX_CHARS", "").strip()
+        self.tools_prompt_max_chars = (int(raw_tools_budget) if raw_tools_budget
+                                       else TOOLS_PROMPT_MAX_CHARS)
 
     @property
     def use_guest(self) -> bool:
@@ -550,6 +557,11 @@ EMPTY_TOOL_RESULT_HINT = "（工具未返回任何结果；可能执行失败、
 TOOL_RESULT_MAX_CHARS = 8000         # 单条工具结果上限
 TOOL_RESULT_TOTAL_MAX_CHARS = 20000  # 所有工具结果累计上限
 WEB_RESULT_MAX_CHARS = 4000          # 网页/抓取类结果的额外上限（噪音多、密度低）
+
+# 工具**定义**在提示词里的体积上限（只算定义行，协议说明永远全文保留）。
+# 真机：CherryHub 几十个 MCP Schema 全量塞入，光定义就上万字，正好把协议本身埋掉 ——
+# 模型开始无视格式、编造工具名。裁剪后被省略的工具仍然可以被调用（解析用的是完整列表）。
+TOOLS_PROMPT_MAX_CHARS = 20000
 WEB_RESULT_HINTS = (
     "fetch", "markdown", "crawl", "browse", "browser", "webpage", "html",
     "snapshot", "open_url", "scrape",
@@ -643,13 +655,13 @@ def render_tool_calls(message: dict, call_names: dict) -> str:
                 args = json.dumps(args, ensure_ascii=False)
             if call.get("id"):
                 call_names[str(call["id"])] = name
-            lines.append(f"[tool_call] {name}({args})")
+            lines.append(f"{name}({args})")
     legacy = message.get("function_call")  # 更老的字段名
     if isinstance(legacy, dict) and legacy.get("name"):
         args = legacy.get("arguments", {})
         if not isinstance(args, str):
             args = json.dumps(args, ensure_ascii=False)
-        lines.append(f"[tool_call] {legacy['name']}({args})")
+        lines.append(f"{legacy['name']}({args})")
     return "\n".join(lines)
 
 
@@ -660,8 +672,10 @@ def convert_messages(messages: list, extra_instructions: str = "",
     额外说明：
     - ``role: "tool"``（以及老式的 ``role: "function"``）会被渲染成 ``Tool(名字): 结果``，
       否则多轮工具调用的上下文会在拍平时**整条丢失**，模型会以为用户没说过话。
-    - ``assistant`` 消息里的 ``tool_calls`` 渲染成 ``[tool_call] 名字(参数)``。
+    - ``assistant`` 消息里的 ``tool_calls`` 渲染成 ``名字(参数)``（行首不带任何标记，
+      见 TOOL_PROTOCOL_HINT：带方括号前缀会被上游自己的工具语法吃掉）。
     - ``extra_instructions`` 用于注入工具协议等附加说明（见 render_tools_prompt）。
+      它会被排在对话**之后**并补一段生成提示 —— 协议块放头部时会被长 system prompt 埋掉。
     - ``clamp_tools``：限制工具结果体积（默认开）。不限制时实测会出现
       单条 7.4 万字的网页结果、峰值 9.3 万字 prompt，模型被淹没后答非所问。
       ``clamp_cfg`` 为 Config 时用其中的阈值，否则用模块默认值。
@@ -724,11 +738,14 @@ def convert_messages(messages: list, extra_instructions: str = "",
     blocks = []
     if instructions:
         blocks.append("# INSTRUCTIONS\n\n" + "\n\n".join(instructions))
-    if extra_instructions:
-        blocks.append(extra_instructions)
     blocks.append("# CONVERSATION")
     for label, text in turns:
         blocks.append(f"{label}: {text}")
+    # 协议块放在对话**之后**：实测放在最前面时，它会被客户端的超长 system prompt 与
+    # 几十个工具定义埋掉，模型直接无视（甚至编出网页端自带的工具名来）。尾部指令的遵守度远高于头部。
+    if extra_instructions:
+        blocks.append(extra_instructions)
+        blocks.append(TOOL_FRAME_TAIL)
     prompt = "\n\n".join(blocks).strip()
     return [{"role": "user", "content": [{"type": "text", "text": prompt + "\n\nAssistant: "}]}]
 
@@ -819,11 +836,13 @@ class StreamAccumulator:
         self.conversation_id = ""
         self.served_model = ""                       # 上游回报的实际模型（如 moe_53f）
         self.parts: dict[str, tuple[str, str]] = {}   # logic_id -> (累积正文, 累积思维链)
+        self.part_order: list[str] = []               # logic_id 的**到达顺序**（见 _ordered_parts）
         self._sent: dict[str, list[str]] = {}         # logic_id -> [已发出的正文, 已发出的思维链]
         self._emitted_parts: set[str] = set()         # 已经吐过内容的 part（用于加分隔）
         self.rewrites = 0                             # 快照与已收分片不连续的次数（仅日志）
         self.rescued = 0                              # 终态补齐次数（接缝处会有少量重复）
         self.platform_tools: list[str] = []           # 上游平台自带工具名，只记录不回传
+        self.platform_results: list[str] = []         # 这些工具回给上游模型的结果（截断）
         self._seen_tools: set[tuple[str, str]] = set()
         self._final = False
         self._warned = False
@@ -841,19 +860,24 @@ class StreamAccumulator:
                 logic_id = str(part["logic_id"])
                 if part.get("model"):
                     self.served_model = str(part["model"])
-                for name in _platform_tool_calls(part):
+                for name, result_head in _platform_tool_calls(part):
                     if (logic_id, name) in self._seen_tools:
                         continue
                     self._seen_tools.add((logic_id, name))
                     self.platform_tools.append(name)
+                    flat = result_head.replace("\r", " ").replace("\n", " ")
+                    self.platform_results.append(f"{name} → {flat}")
                     log(f"[upstream] 平台自带工具 {name} 被调用了："
-                        "上游自己执行并把结果用于作答，不会回传给客户端")
+                        "上游自己执行并把结果用于作答，不会回传给客户端"
+                        + (f"；上游看到的结果：{flat!r}" if flat else "（无结果文本）"))
                 self._absorb(logic_id, _render_part(part))
 
         return self._flush(str(event.get("status")) in ("finish", "intervene"))
 
     def _absorb(self, logic_id: str, incoming: tuple[str, str]) -> None:
         """把一帧的 part 内容并进累积态。"""
+        if logic_id not in self.parts and logic_id not in self.part_order:
+            self.part_order.append(logic_id)
         held = self.parts.get(logic_id, ("", ""))
         merged = list(held)
         for slot, chunk in enumerate(incoming):
@@ -884,7 +908,7 @@ class StreamAccumulator:
         text_delta: list[str] = []
         reason_delta: list[str] = []
 
-        for logic_id in sorted(self.parts):
+        for logic_id in self._ordered_ids():
             current = self.parts[logic_id]
             sent = self._sent.setdefault(logic_id, ["", ""])
 
@@ -922,13 +946,28 @@ class StreamAccumulator:
 
         return "".join(text_delta), "".join(reason_delta)
 
+    def _ordered_ids(self) -> list[str]:
+        """part 的**到达顺序**，兜底补上任何没记进 order 的 id。
+
+        原来这里用 ``sorted(self.parts)`` 按 logic_id 字符串排序：上游的分片消息是
+        ``p1…p9、p10``，字符串排序下 ``'p10' < 'p9'``，多 part 的回答会被排成
+        前后颠倒的一坨。到达顺序才是上游的叙述顺序。
+        """
+        ordered = [lid for lid in self.part_order if lid in self.parts]
+        ordered += [lid for lid in self.parts if lid not in set(ordered)]
+        return ordered
+
+    def part_texts(self) -> list[str]:
+        """各 part 的正文（按到达顺序、已 strip），空 part 不返回。"""
+        return [self.parts[lid][0].strip() for lid in self._ordered_ids()
+                if self.parts[lid][0].strip()]
+
     def full_text(self) -> str:
-        return "\n\n".join(x for x in (t.strip() for t, _ in
-                                      (self.parts[k] for k in sorted(self.parts))) if x)
+        return "\n\n".join(self.part_texts())
 
     def full_reasoning(self) -> str:
         return "\n\n".join(x for x in (r.strip() for _, r in
-                                      (self.parts[k] for k in sorted(self.parts))) if x)
+                                      (self.parts[k] for k in self._ordered_ids())) if x)
 
 
 def _render_part(part: dict) -> tuple[str, str]:
@@ -961,26 +1000,53 @@ def _render_part(part: dict) -> tuple[str, str]:
     return "\n".join(x for x in texts if x), "\n".join(x for x in reasonings if x)
 
 
-def _platform_tool_calls(part: dict) -> list[str]:
-    """上游**平台自带工具**（search / 沙箱执行等）在这一个 part 里的调用名。
+# 上游自带工具的结果只留这一头进日志：足够看清上游沙箱回了什么（是报错还是数据），
+# 又不会把整份网页抓取灌进日志文件。
+PLATFORM_TOOL_RESULT_LOG_CHARS = 200
+
+
+def _platform_tool_calls(part: dict) -> list[tuple[str, str]]:
+    """上游**平台自带工具**（search / 沙箱执行等）在这一个 part 里的 ``(调用名, 结果文本头)``。
 
     形状（抓帧实测）：``{"type":"tool_calls","tool_calls":{"id","name","arguments"}}``，
     后面还会跟一个 ``type=="tool_result"`` 的 item —— 说明上游已经自己把工具跑完了。
 
     ⚠ 只记录、**绝不翻译成客户端的 tool_calls**：这些工具不在客户端声明的 ``tools`` 里，
     客户端也没有它们的实现，回传会让客户端去执行一个不存在的工具并卡在等结果。
+
+    结果文本必须留一头日志：这些结果是喂给**上游模型**的，我们和客户端都看不到。
+    实测就被这个盲区坑了一整轮排查 —— 模型转述「unknown tool call」，但没有任何
+    落地证据能说明这句话出自上游还是客户端，只能靠猜。
     """
-    names = []
+    calls: list[tuple[str, str]] = []
+    named_results: dict[str, str] = {}
+    anon_results: list[str] = []
     for item in part.get("content") or []:
-        if not isinstance(item, dict) or item.get("type") != "tool_calls":
+        if not isinstance(item, dict):
             continue
-        call = item.get("tool_calls")
-        if not isinstance(call, dict):
-            continue
-        name = str(call.get("name") or "").strip()
-        if name:
-            names.append(name)
-    return names
+        if item.get("type") == "tool_calls":
+            call = item.get("tool_calls")
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("name") or "").strip()
+            if name:
+                calls.append((str(call.get("id") or ""), name))
+        elif item.get("type") == "tool_result":
+            res = item.get("tool_result")
+            if not isinstance(res, dict):
+                continue
+            text = str(res.get("content") or "").strip()
+            if res.get("id"):
+                named_results[str(res["id"])] = text
+            else:
+                anon_results.append(text)
+    found: list[tuple[str, str]] = []
+    for index, (call_id, name) in enumerate(calls):
+        text = named_results.get(call_id) or ""
+        if not text and index < len(anon_results):
+            text = anon_results[index]
+        found.append((name, text[:PLATFORM_TOOL_RESULT_LOG_CHARS]))
+    return found
 
 
 # ─────────────────────────── 上游调用 ───────────────────────────
@@ -1066,30 +1132,147 @@ def extract_tool_definitions(payload: dict) -> list[dict]:
 
 TOOL_PROTOCOL_HINT = """# TOOLS
 
-你可以调用下面这些工具。需要调用时，**只输出一行 JSON，不要有任何其它文字、解释或代码块**：
+你可以调用下面这些工具。需要调用时，**每个调用单独一行、行首直接写工具名、
+后面紧跟一个 JSON 对象参数，这一行不要有别的文字、解释或代码块**：
 
-{"tool_calls":[{"name":"工具名","arguments":{"参数名":"参数值"}}]}
+工具名({"参数名": "参数值"})
 
-可以一次调用多个工具（数组里放多个对象）。如果不需要调用工具，就按平时那样正常回答用户。
+一次要调用多个工具就写多行（每行一个调用）。如果不需要调用工具，就按平时那样正常回答用户。
 
 【最重要】只要你决定要调用工具（包括「结果不理想，想换个关键词／换个工具再搜一次」这种情况），
-就必须**当场输出上面那种 JSON 调用本身**。绝不允许把「我再去搜一下」「换个词试试」这类意图
-只写在思考或正文里而不真正输出 JSON —— 那样系统收不到调用，什么都不会执行。
-换句话说：**「想调用」不等于「已调用」**，想调用就必须把 JSON 打出来。
+就必须**当场输出上面那种调用行本身**。绝不允许把「我再去搜一下」「换个词试试」这类意图
+只写在思考或正文里而不真正输出调用行 —— 那样系统收不到调用，什么都不会执行。
+换句话说：**「想调用」不等于「已调用」**，想调用就必须把调用行打出来。
 
-可用工具：
+【行首硬要求】调用行必须**以工具名开头**，前面不许有任何方括号标记、前缀词或代码块围栏。
+带方括号前缀的写法会被网页端按它自己的工具调用语法吃掉（前缀连同半截工具名一起被吞），
+结果既不是本客户端的调用、也拿不到真实数据。这与你能看到的过往对话里助手的写法一致。
+
+【形状硬要求】**不要**输出 {"tool_calls": [...]} 这种 JSON 作为调用。那是网页端自己那套
+工具调用的写法：这么写会被网页端当成它自带的工具拦下执行，本地客户端收不到调用，
+工具一次也不会跑，最后只会得到一句「查不到数据」。调用一律写成上面那种
+「行首工具名 + JSON 参数」的文字形态。
+
+%s可用工具：
 %s"""
 
 
-def render_tools_prompt(tools: list[dict]) -> str:
-    """把 OpenAI 的 tools 定义渲染成提示词（替代原生 function calling）。"""
-    lines = []
+# 放在协议块之后的生成提示。没有协议块时不追加（否则「按上面 # TOOLS 的协议」会指向不存在的内容）。
+TOOL_FRAME_TAIL = (
+    "（现在轮到你回答。需要工具就按上面 # TOOLS 的协议，另起一行直接输出调用行本身；"
+    "不需要工具就只输出给用户的最终答案。）"
+    "（禁止旁白与自述推理：不要写“我接下来要…”“让我先去搜一下”这类句子，也不要复述本要求；"
+    "用用户使用的语言回答。）"
+)
+
+# 示例值要「像那个参数」：给 path 填一句查询词，模型就照抄出一个不像路径的路径。
+_EXAMPLE_VALUE_RULES = (
+    (("filepath", "file_path", "path", "file", "filename", "dir", "directory"), "./a.txt"),
+    (("url", "link", "href"), "https://example.com"),
+    (("city", "location"), "北京"),
+    (("query", "keyword", "q"), "北京 今日 客流"),
+)
+
+
+def _example_value(key: str) -> str:
+    lowered = key.lower()
+    for words, value in _EXAMPLE_VALUE_RULES:
+        if any(word in lowered for word in words):
+            return value
+    return "示例值"
+
+
+def _example_args(tool: dict) -> dict | None:
+    """造一个「必填参数一个不缺」的参数字典；造不出合格示例返回 None。
+
+    必填里有非 string 项、或必填多于一个，就放弃举例 —— 半截示例比没有示例更坏，
+    模型会照抄形状并把剩下的参数漏掉（真机实测正是这个形态：``invoke({})``）。
+    """
+    params = tool.get("parameters") or {}
+    props = params.get("properties")
+    if not isinstance(props, dict) or not props:
+        return None
+    strings = [key for key, spec in props.items()
+               if isinstance(spec, dict) and str(spec.get("type", "")).lower() == "string"]
+    if not strings:
+        return None
+    required = params.get("required")
+    required = required if isinstance(required, list) else []
+    if len(required) == 1 and required[0] in strings:
+        return {required[0]: _example_value(str(required[0]))}
+    if required:
+        return None
+    return {strings[0]: _example_value(str(strings[0]))}
+
+
+def _counterexample_name(declared: set[str]) -> str:
+    """「编造工具名」反例用的名字 —— 必须不在本会话列表里，否则反例会劝退真工具。"""
+    for candidate in ("open_url", "search_web", "fetch_url"):
+        if candidate not in declared:
+            return candidate
+    return ""
+
+
+def _render_example_block(tools: list[dict]) -> str:
+    """协议示例：用**本会话真实存在的工具名与必填参数**，而不是抽象占位名。"""
+    chosen, best_score = "", 0
     for tool in tools:
-        lines.append(f"- {tool['name']}：{tool['description'] or '（无描述）'}")
+        args = _example_args(tool)
+        if args is None:
+            continue
+        required = (tool.get("parameters") or {}).get("required")
+        score = 2 if isinstance(required, list) and required else 1
+        if score > best_score:
+            chosen = f"{tool['name']}({json.dumps(args, ensure_ascii=False)})"
+            best_score = score
+    if not chosen:
+        return ""
+    name = chosen.split("(", 1)[0]
+    fake = _counterexample_name({t["name"] for t in tools})
+    wrong = [f"- 漏参数：{name}({{}})"]
+    if fake:
+        wrong.append(f"- 编造工具名：{fake}({{\"q\": \"示例值\"}})"
+                     "   ← 上面列表之外的任何工具名在本端都不存在")
+    return (
+        "正确示例（工具名与参数都取自下方列表，必填参数一个都不能少）：\n"
+        f"{chosen}\n\n"
+        "常见错误（网页端一律不会执行，别这样写）：\n"
+        + "\n".join(wrong) + "\n\n"
+    )
+
+
+def render_tools_prompt(tools: list[dict], max_chars: int = TOOLS_PROMPT_MAX_CHARS) -> str:
+    """把 OpenAI 的 tools 定义渲染成提示词（替代原生 function calling）。
+
+    ``max_chars`` 只约束**定义行**，协议说明永远全文保留：真机几十个 MCP Schema 全量塞入
+    会把协议本身埋掉，模型于是无视格式、编造工具名。``<=0`` 表示不裁剪。
+    第一个放不下的工具**及其后所有工具**都只列名字（保持列表顺序可预期）。
+    注意：裁剪只影响提示词，不影响能否解析 —— 调用名集合始终来自完整工具列表。
+    """
+    lines: list[str] = []
+    skipped: list[str] = []
+    used = 0
+    stopped = False
+    for tool in tools:
+        line = f"- {tool['name']}：{tool['description'] or '（无描述）'}"
         params = tool.get("parameters") or {}
         if params:
-            lines.append(f"  参数 JSON Schema：{json.dumps(params, ensure_ascii=False)}")
-    return TOOL_PROTOCOL_HINT % "\n".join(lines)
+            line += f"\n  参数 JSON Schema：{json.dumps(params, ensure_ascii=False)}"
+        if stopped or (max_chars > 0 and used + len(line) > max_chars):
+            stopped = True
+            skipped.append(tool["name"])
+            continue
+        used += len(line)
+        lines.append(line)
+
+    if skipped:
+        log(f"[tools] 工具定义超预算已裁剪：{len(tools) - len(skipped)} 个完整展开、"
+            f"{len(skipped)} 个仅列名字（{'、'.join(skipped[:5])}"
+            f"{'…' if len(skipped) > 5 else ''}）")
+        # 标题把「哪些工具参数没展开」说在前面，否则模型会以为列表里每个工具都能直接调
+        lines.insert(0, f"（以下 {len(lines)} 个参数完整，另有 {len(skipped)} 个仅列名字）")
+        lines.append("未展开的工具（参数请勿猜测，猜了必失败）：" + "、".join(skipped))
+    return TOOL_PROTOCOL_HINT % (_render_example_block(tools), "\n".join(lines))
 
 
 def _strip_code_fence(text: str) -> str:
@@ -1226,19 +1409,83 @@ def _loads_with_inner_quote_fix(text: str, start: int) -> dict | None:
     return None
 
 
-def _json_candidates(text: str, start: int):
-    """按优先级产出待尝试的 JSON 文本变体：原样 → 补齐缺失的闭合符号。
+_VALID_JSON_ESCAPES = '"\\/bfnrtu'
 
-    **只在「切点落在结构边界上」时才补齐**：末尾缺 ``}]}`` 属于纯粹的结构不完整，
+
+def _fix_invalid_escapes(text: str) -> str:
+    """把 JSON 里的**非法单反斜杠**补成合法转义（``C:\\Users`` → ``C:\\\\Users``）。
+
+    实测事故（Windows 上的文件类工具最高频）：模型写 ``{"path": "C:\\Users\\x"}``，
+    ``\\U``/``\\x`` 都不是合法 JSON 转义，整个对象直接解析失败，本该执行的工具调用
+    退化成一段散文，日志里还看不出原因。
+
+    这里**必须成对扫描**而不是用一个正则：``\\\\`` 是两个反斜杠，
+    纯正则会看到「第二个反斜杠后面跟着 ``U``」就把已经写对的内容再补一遍，
+    越修越多（本函数的第一版就是这么写错的，测试 ``test_escape_fix_is_idempotent`` 拦住了它）。
+
+    残留坑（同类实现也一样，先记着别硬修）：``C:\\new\\test`` 里的 ``\\n``/``\\t``
+    **是**合法转义，会被静默解释成换行/制表符而吃掉字母；``\\uXXXX`` 同理。
+    """
+    out: list[str] = []
+    index, size = 0, len(text)
+    while index < size:
+        ch = text[index]
+        if ch != "\\":
+            out.append(ch)
+            index += 1
+            continue
+        nxt = text[index + 1] if index + 1 < size else ""
+        if nxt == "\\":                       # 已经是一对合法转义，整体带走
+            out.append("\\\\")
+            index += 2
+        elif nxt == "" or nxt in _VALID_JSON_ESCAPES:
+            out.append(ch + nxt)              # 合法转义或末尾孤立反斜杠：原样
+            index += 2 if nxt else 1
+        else:                                 # 非法：单反斜杠 → 双反斜杠
+            out.append("\\\\" + nxt)
+            index += 2
+    return "".join(out)
+
+
+def _normalize_fullwidth_quotes(text: str) -> str:
+    """把全角引号当定界符的写法换回 ASCII（中文模型高频：``{“city”:“北京”}``）。
+
+    只在原样解析失败之后才试，所以代价是「值里本来就成对出现的全角引号」会被误当定界符 ——
+    比起整条工具链被废掉，这个取舍划得来。
+    """
+    return (text.replace("“", "\"").replace("”", "\"")
+                .replace("‘", "'").replace("’", "'"))
+
+
+def _json_candidates(text: str, start: int):
+    """按优先级产出待尝试的 JSON 文本变体。
+
+    顺序（便宜、无损的在前，同一候选只产一次）：
+    原样 → 补闭合 → 修单反斜杠 → 修单反斜杠+补闭合 → 全角引号 → 全角引号+补闭合。
+
+    **只改写 ``text[start:]`` 再拼回前缀**：调用方用 ``raw_decode(candidate, start)``
+    按下标取对象，前缀里的杂质不能影响偏移量，所以任何变换都不能碰 ``text[:start]``。
+
+    **补齐闭合符号只在「切点落在结构边界上」时做**：末尾缺 ``}]}`` 属于纯粹的结构不完整，
     参数本身是完整的，补上就能得到与模型意图一致的调用。
     但如果截断点落在**字符串或数值内部**（比如 query 只写了一半），补齐会造出
     一个参数被腰斩的调用 —— 那比不调用更危险（客户端会拿着残缺参数去执行）。
-    这种情况下不产出候选，维持「宁可退化成普通回答，也不给错调用」的原有原则。
+    这种情况下不产出该候选，维持「宁可退化成普通回答，也不给错调用」的原有原则。
+    补齐量是**按变换后的片段重新算**的：单反斜杠没修时 ``\\U`` 会让扫描器把字符串
+    结尾的引号误当成被转义，误判成「切点落在字符串内部」而拒绝补齐。
     """
-    yield text
-    closing = _missing_closers(text, start)
-    if closing:
-        yield text + closing
+    head, frag = text[:start], text[start:]
+    variants = [frag]
+    for extra in (_fix_invalid_escapes(frag), _normalize_fullwidth_quotes(frag)):
+        if extra != frag:
+            variants.append(extra)
+    seen = set()
+    for base in variants:
+        for candidate in (base, base + _missing_closers(base, 0)):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            yield head + candidate
 
 
 def _missing_closers(text: str, start: int) -> str:
@@ -1303,9 +1550,37 @@ def _missing_closers(text: str, start: int) -> str:
     if not stack:
         return ""
     return "".join(pairs[c] for c in reversed(stack))
-    if not stack:
-        return ""
-    return "".join(pairs[c] for c in reversed(stack))
+
+
+def _norm_args(arguments: str) -> str:
+    """参数 JSON 归一化成可比较的串（键排序、去多余空白）；解析不了就按原文比。"""
+    try:
+        return json.dumps(json.loads(arguments), sort_keys=True, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError):
+        return (arguments or "").strip()
+
+
+def _dedupe_calls(calls: list[dict]) -> list[dict]:
+    """同名同参的调用只留第一个（保留它的 id）。
+
+    实测上游会把同一个工具块输出两遍：先是半截的、最后是完整版，两处都能解析成合法调用。
+    不去重客户端就会执行两次 —— 写文件、发消息这类工具重复执行有真实副作用，
+    不是单纯的显示问题。代价：客户端真想并行发两个同名同参调用时会被压成一个。
+    """
+    if len(calls) < 2:
+        return calls
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for call in calls:
+        fn = call.get("function") or {}
+        key = (str(fn.get("name") or ""), _norm_args(str(fn.get("arguments") or "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(call)
+    if len(out) != len(calls):
+        log(f"[tools] 上游把同一次调用输出了两遍，已去重 {len(calls)}→{len(out)}")
+    return out
 
 
 def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> list[dict] | None:
@@ -1313,6 +1588,7 @@ def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> list[d
 
     只认两种形状：``{"tool_calls":[{...}]}`` 和 ``{"name":..,"arguments":..}``。
     解析失败就当作普通回答 —— 宁可退化成聊天，也不要给出错误的工具调用。
+    同名同参的重复项会被合并（见 :func:`_dedupe_calls`）。
     """
     if not text or not text.strip():
         return None
@@ -1346,7 +1622,7 @@ def parse_tool_calls(text: str, allowed_names: set[str] | None = None) -> list[d
             "type": "function",
             "function": {"name": name, "arguments": args},
         })
-    return calls
+    return _dedupe_calls(calls)
 
 
 def _find_closing(text: str, start: int) -> int:
@@ -1375,15 +1651,23 @@ def _find_closing(text: str, start: int) -> int:
 
 
 def _loads_tolerant_obj(text: str):
-    """把 JS 风格对象字面量转成 dict（键可无引号、可单引号、可尾逗号）。失败返回 None。"""
+    """把 JS 风格对象字面量转成 dict（键可无引号、可单引号、可尾逗号）。失败返回 None。
+
+    规范化之后再补一级抢救：修单反斜杠（``C:\\Users``）、全角引号（``{“city”:“北京”}``）。
+    **顺序很关键**：这两级只在「规范化结果直接解析失败」之后才试 ——
+    上面的单引号规则本来就会把路径里的反斜杠正确地重新转义，先修再转会把反斜杠加倍。
+    """
     body = re.sub(r"([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)", r'\1"\2"\3', text)
     body = re.sub(r"'((?:[^'\\]|\\.)*)'", lambda m: json.dumps(m.group(1).replace("\\'", "'")), body)
     body = re.sub(r",(\s*[}\]])", r"\1", body)
-    try:
-        obj = json.loads(body)
-    except json.JSONDecodeError:
-        return None
-    return obj if isinstance(obj, dict) else None
+    for candidate in (body, _fix_invalid_escapes(body), _normalize_fullwidth_quotes(body)):
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
 
 
 TEXTUAL_CALL_MAX = 4
@@ -1401,9 +1685,17 @@ THINK_LEAK_PHRASES = (
     "next, i", "instead, let", "search results", "no results", "not useful",
     "try opening", "try browsing", "i need to", "seems like", "maybe i",
     "try fetching", "let me browse", "try browse", "useless",
+    # 实测漏判：模型换了一套措辞（"Let me search for this" / "Now let me search"），
+    # 表里没有 → 裸思维链被当成答案返回给了客户端。
+    "let me search", "let me look", "let me check", "let me use", "let me query",
+    "now let me", "i should search", "i should look", "i could try", "i'll search",
 )
 # 句子收尾标点（中英文）。缺它往往意味着话说到一半被截断。
 _SENTENCE_END = ".。!！?？\"'”’)]）】"
+
+# 正文与思维链重合判定的最小长度：短回答（「好的」「47万」）整段出现在思考里是常态，
+# 低于这个长度就不按「思考副本」判定，免得把正常回答打成泄漏。
+THINK_LEAK_OVERLAP_MIN = 100
 
 # 续问次数用尽、模型仍只吐思考没给结论时，返回这段明确提示而不是裸思维链。
 THINK_LEAK_FALLBACK = (
@@ -1432,15 +1724,31 @@ def _plausible_answer(text: str) -> bool:
     ))
 
 
+def _copied_from_reasoning(body: str, reason: str) -> bool:
+    """正文是不是思维链的副本 —— 不依赖措辞、也不依赖语言的硬信号。
+
+    实测上游会把同一段思考同时写进正文槽与 think 槽（正文 493 字 == 思维链 493 字，
+    一字不差），客户端于是把英文自言自语当答案展示给用户。正常回答与思考是两份
+    不同文本，只有泄漏才会高度重合。
+
+    要求双方都不短：短回答（如「好的」）很容易整段出现在思维链里，不设门槛会误杀。
+    """
+    if len(body) < THINK_LEAK_OVERLAP_MIN or len(reason) < THINK_LEAK_OVERLAP_MIN:
+        return False
+    return (body == reason or body in reason or reason in body
+            or _common_prefix_len(body, reason) >= min(len(body), len(reason)) * 0.8)
+
+
 def looks_like_think_leak(text: str, reasoning: str = "") -> bool:
     """判断这次输出是不是「只有碎碎念、没有给用户的结论」。
 
-    两种形态都要拦住：
+    三种形态都要拦住：
 
     * **形态 A（碎碎念进了正文）**：正文命中碎碎念词且结尾被截断；
       若正文与思维链高度重合，也直接判定。
     * **形态 B（正文为空、碎碎念在思维链）**：正文为空而思维链在自言自语，
       用户最终只看到这串碎碎念（思维链会被客户端渲染出来）。
+    * **形态 D（思考被复制进正文）**：正文就是思维链的副本，与措辞无关。
 
     为了不误杀正常回答：命中碎碎念词但**正文看起来是完整结论**时不判定。
     """
@@ -1459,20 +1767,64 @@ def looks_like_think_leak(text: str, reasoning: str = "") -> bool:
         low = reason.lower()
         return any(p in low for p in THINK_LEAK_PHRASES)
 
-    # 形态 A：正文非空。
+    # 形态 A/D：正文非空。副本判定必须排在短语表门槛**之前**——
+    # 实测 493 字的英文思考（"Let me search …"）不在措辞表里，被门槛短路放过，
+    # 于是裸思维链当成答案返回了客户端；而重合度这条硬信号本来写在门槛之后，走不到。
+    if _copied_from_reasoning(body, reason):
+        return True
+
     low = body.lower()
     if not any(p in low for p in THINK_LEAK_PHRASES):
         return False
     # 正文像真回答（给了数字/建议/结论）→ 不判定，宁可漏判不误杀
     if _plausible_answer(body):
         return False
-    if body[-1] not in _SENTENCE_END:
-        return True
-    # 没被截断时，要求与思维链高度重合才判定（说明思考被复制到了正文槽）
-    if reason and (body in reason or reason in body
-                   or _common_prefix_len(body, reason) >= min(len(body), len(reason)) * 0.8):
-        return True
-    return False
+    # 完整收尾且不是思考副本 → 当成正常回答（实测正常回答也会提「search results」）
+    return body[-1] not in _SENTENCE_END
+
+
+# 过程旁白的判定上限：真正的结论往往很长，只有短分片才可能是「我下一步要干嘛」。
+NARRATION_MAX_CHARS = 300
+
+# 「我要去干什么」的起手式。刻意只收第一人称意图表达，不收「可以/建议/目前」这类
+# 真回答里也高频出现的词 —— 宁可漏删，也不能把用户的实际答案吃掉。
+_NARRATION_RE = re.compile(
+    r"(我再|我还要|我再去|我继续|我准备|我打算|我先|我现在去|接下来我|下面我|让我(?:先|去|再)|"
+    r"试着(?:查|搜|看)|换个(?:关键词|词|工具)?"
+    r"|\blet\s+me\b|\bnow\s+i(?:'ll| will| should| need)\b|\bi(?:'ll| should| need to| will)\b"
+    r"|\bi\s+(?:try|check|search|look)\b)",
+    re.IGNORECASE)
+
+
+def is_process_narration(text: str) -> bool:
+    """这一小段是不是上游分步消息里的过程旁白，而不是给用户的结论。
+
+    实测（18:37 那轮）950 字答案尾部挂着两段
+    「北京旅游网首页已成功打开…我再进一步查找今天各景区的实时人数信息」——
+    上游 agent 每一步都产出一个 part，全部拼进正文就当答案发回客户端了。
+
+    判定刻意保守：带数字（说明给了事实/结论）或超过 NARRATION_MAX_CHARS 的一律保留。
+    """
+    body = (text or "").strip()
+    if not body or len(body) > NARRATION_MAX_CHARS:
+        return False
+    if any(ch.isdigit() for ch in body):
+        return False
+    return bool(_NARRATION_RE.search(body))
+
+
+def join_answer_parts(texts: list[str], strip_narration: bool = True) -> str:
+    """把各 part 的正文拼成给客户端的答案，逐份剔掉纯过程旁白。
+
+    只做「逐份判定 + 剔除」这一件事：全被剔时宁可原样返回，也不吃掉了用户的实际答案。
+    （不猜测「最后一份才是结论」—— 上游把一段正常回答按段落切成多个 part 是常态，
+    那种猜测会把答案砍得只剩尾巴。）
+    """
+    chunks = [t.strip() for t in texts if t and t.strip()]
+    if len(chunks) <= 1 or not strip_narration:
+        return "\n\n".join(chunks)
+    kept = [c for c in chunks if not is_process_narration(c)]
+    return "\n\n".join(kept or chunks)
 
 
 def looks_like_wanted_tool_call(text: str, reasoning: str, tool_names: set[str]) -> bool:
@@ -1496,6 +1848,42 @@ def looks_like_wanted_tool_call(text: str, reasoning: str, tool_names: set[str])
     return any(s in haystack for s in short)
 
 
+def _tool_suffix_map(allowed_names: set[str]) -> dict[str, str]:
+    """客户端注册名 → 模型可能写出的各种名字。
+
+    完整名和最后一段短名都收录：模型时而写 ``invoke(...)``，时而写
+    ``mcp__CherryHub__invoke(...)``，两种都得能认。
+    """
+    mapping: dict[str, str] = {}
+    for name in allowed_names:
+        tail = name.rsplit("__", 1)[-1].rsplit(".", 1)[-1].strip()
+        for key in (name.strip(), tail):
+            if key:
+                mapping.setdefault(key.lower(), name)
+    return mapping
+
+
+def hijacked_client_tools(platform_tools: list[str], allowed_names: set[str]) -> list[str]:
+    """上游「自带工具执行记录」里属于客户端 tools 的那几个 —— 即被上游抢跑的工具。
+
+    名字常常对不上：上游会把没吃干净的语法碎片留在名字里（实测回传的是
+    ``tool_call] mcp__CherryHub__invoke`` —— 前缀 ``[tool_`` 被它自己的调用语法吞掉，
+    剩下半截当成工具名）。所以先剥掉方括号碎片，再按「完整名 / 最后一段短名」比对。
+    """
+    if not platform_tools or not allowed_names:
+        return []
+    suffix_to_tool = _tool_suffix_map(allowed_names)
+    hit = set()
+    for name in platform_tools:
+        cleaned = name.split("]")[-1].strip()
+        for candidate in (cleaned, cleaned.rsplit("__", 1)[-1].rsplit(".", 1)[-1]):
+            tool = suffix_to_tool.get(candidate.lower())
+            if tool:
+                hit.add(tool)
+                break
+    return sorted(hit)
+
+
 def parse_textual_tool_calls(text: str, allowed_names: set[str]) -> list[dict] | None:
     """兜底：模型被客户端自带的说明带跑、用 JS 风格写工具调用时，也翻译成标准 tool_calls。
 
@@ -1505,14 +1893,7 @@ def parse_textual_tool_calls(text: str, allowed_names: set[str]) -> list[dict] |
     """
     if not text or not allowed_names:
         return None
-    suffix_to_tool: dict[str, str] = {}
-    for name in allowed_names:
-        # 同时收录完整名与最后一段短名：模型时而写 invoke(...)，时而写
-        # mcp__CherryHub__invoke(...)，两种都得认。
-        tail = name.rsplit("__", 1)[-1].rsplit(".", 1)[-1].strip()
-        for key in (name.strip(), tail):
-            if key:
-                suffix_to_tool.setdefault(key.lower(), name)
+    suffix_to_tool = _tool_suffix_map(allowed_names)
     if not suffix_to_tool:
         return None
 
@@ -1540,9 +1921,9 @@ def parse_textual_tool_calls(text: str, allowed_names: set[str]) -> list[dict] |
             "type": "function",
             "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)},
         })
-        if len(calls) >= TEXTUAL_CALL_MAX:
-            break
-    return calls or None
+    # 不在这里提前 break：上游常把同一个块输出两遍，截断版会白占一个额度。
+    # 先收全、去重，再限数。
+    return _dedupe_calls(calls)[:TEXTUAL_CALL_MAX] or None
 
 
 class GLMClient:
@@ -1849,7 +2230,8 @@ class Handler(BaseHTTPRequestHandler):
         # 工具真正由客户端执行（客户端拿到 tool_calls 后执行，再把 role:"tool" 结果发回来）。
         tool_defs = extract_tool_definitions(payload)
         tools = tool_defs if self.config.prompt_tool_calling else []
-        tools_instructions = render_tools_prompt(tools) if tools else ""
+        tools_instructions = (render_tools_prompt(tools, self.config.tools_prompt_max_chars)
+                              if tools else "")
         if tool_defs and not tools:
             log(f"[compat] 请求带 {len(tool_defs)} 个工具定义，但 GLM_PROMPT_TOOL_CALLING=false，已忽略")
         elif tools:
@@ -2106,7 +2488,8 @@ class Handler(BaseHTTPRequestHandler):
             acc = self._consume_all(resp, on_reasoning=stream_reasoning if emit else None)
             self._served_model = acc.served_model
             self._log_served_model()
-            text = acc.full_text()
+            text = join_answer_parts(
+                acc.part_texts(), self.config.strip_process_narration)
             calls = parse_tool_calls(text, allowed)
             if not calls:
                 # 兜底：客户端自带的工具说明（如 Cherry 的 list/inspect/invoke/exec）通常更强势，
@@ -2116,13 +2499,25 @@ class Handler(BaseHTTPRequestHandler):
                     log(f"[tools] 文字风格调用已翻译为 tool_calls："
                         f"{[c['function']['name'] for c in calls]}")
 
-            # 没解析出调用，且输出像是泄漏的思考 → 续问一次，而不是把碎碎念当答案返回。
-            # 注意要同时喂正文和思维链：形态 B 下正文为空、碎碎念只在思维链里。
+            # 没解析出调用，但有两种「必须重试」的成因：
+            #   ① 上游抢跑 —— 模型把该回客户端的调用写成了文本，被上游自己的
+            #      function-call 层拦下执行（实测 mcp__CherryHub__exec / invoke）。
+            #      客户端的工具压根没跑，模型收到的是上游沙箱里的失败结果，
+            #      于是得出「搜索接口异常」的结论并给一个残缺回答。
+            #   ② 思考泄漏 —— 输出像是泄漏的思考，把碎碎念当答案返回了。
+            # 注意 ② 要同时喂正文和思维链：形态 B 下正文为空、碎碎念只在思维链里。
             reason = acc.full_reasoning()
-            if not calls and attempt < tries and looks_like_think_leak(text, reason):
+            hijacked = hijacked_client_tools(acc.platform_tools, allowed)
+            if not calls and attempt < tries and (
+                    hijacked or looks_like_think_leak(text, reason)):
                 attempt += 1
                 leaked = (text or reason).strip()
-                if leaked:
+                if hijacked:
+                    detail = (f"；上游拿到的结果：{acc.platform_results[-1][:120]!r}"
+                              if acc.platform_results else "")
+                    log(f"[tools] 上游抢跑：客户端工具 {hijacked} 被上游自己执行了，"
+                        f"客户端从未收到这次调用（第 {attempt}/{tries} 次续问）{detail}")
+                elif leaked:
                     log(f"[tools] 输出疑似泄漏的思考（无回答、无调用），自动续问"
                         f"（第 {attempt}/{tries} 次，正文{len(text or '')}字/"
                         f"思维链{len(reason)}字）。开头：{leaked[:100]!r}")
@@ -2143,7 +2538,7 @@ class Handler(BaseHTTPRequestHandler):
                     release_lease()
                 new_resp, new_lease = self._continue_after_think_leak(
                     messages, leaked, model, networking, tools_instructions,
-                    assistant_id, account, deep_thinking)
+                    assistant_id, account, deep_thinking, hijacked=hijacked)
                 if new_resp is None:
                     break   # 续问失败：把这一轮原样返回，好过丢掉已有内容
                 resp, extra_lease = new_resp, new_lease
@@ -2159,16 +2554,23 @@ class Handler(BaseHTTPRequestHandler):
                         log("[tools] 续问后模型仍无任何输出，返回明确提示")
                     text = THINK_LEAK_FALLBACK
                 else:
-                    # ⚠ 这里**不是**异常：模型主动选择用文字回答（协议允许，
-                    # finish_reason=stop）。早先统一打成「模型没按工具协议输出」，
-                    # 会让正常回答看起来像故障 —— 实测 10 次里 8 次是正常回答。
-                    head = text[:160].replace("\n", " ")
-                    log(f"[tools] 模型选择直接回答（未调用工具），按普通回答返回。"
-                        f"正文{len(text)}字。开头：{head!r}")
-                    # 诊断只在「看起来确实想调用却没调出来」时打，
-                    # 否则正常回答也会刷一堆无意义的诊断行。
-                    if looks_like_wanted_tool_call(text, reason, allowed):
+                    if hijacked:
+                        # 抢跑且续问次数用尽：这不是「模型选择直接回答」，
+                        # 而是客户端工具根本没执行、答案建立在上游沙箱的失败结果上。
+                        log(f"[tools] 上游抢跑且续问已用尽：客户端工具 {hijacked} 未执行，"
+                            f"本轮答案可能缺少实时数据。正文{len(text)}字。")
                         self._diagnose_tool_miss(text, reason, allowed)
+                    else:
+                        # ⚠ 这里**不是**异常：模型主动选择用文字回答（协议允许，
+                        # finish_reason=stop）。早先统一打成「模型没按工具协议输出」，
+                        # 会让正常回答看起来像故障 —— 实测 10 次里 8 次是正常回答。
+                        head = text[:160].replace("\n", " ")
+                        log(f"[tools] 模型选择直接回答（未调用工具），按普通回答返回。"
+                            f"正文{len(text)}字。开头：{head!r}")
+                        # 诊断只在「看起来确实想调用却没调出来」时打，
+                        # 否则正常回答也会刷一堆无意义的诊断行。
+                        if looks_like_wanted_tool_call(text, reason, allowed):
+                            self._diagnose_tool_miss(text, reason, allowed)
             # 本轮若持有续问租约（已达续问上限或续问失败），立刻交回去：
             # 否则账号槽位会被占住，后续请求只能排队到超时。
             if extra_lease is not None:
@@ -2211,13 +2613,31 @@ class Handler(BaseHTTPRequestHandler):
     def _continue_after_think_leak(self, messages: list, leaked: str, model: str,
                                    networking: bool, tools_instructions: str,
                                    assistant_id: str, account: "Account" = None,
-                                   deep_thinking: bool = False):
-        """思考泄漏后续问：把它刚才那段碎碎念当成 assistant 说过的话，再要求它给出结论。
+                                   deep_thinking: bool = False,
+                                   hijacked: list[str] | None = None):
+        """续问：把上一轮的问题输出当成 assistant 说过的话，再要求它给出可用结果。
+
+        ``hijacked`` 非空时是「上游抢跑」场景 —— 该回客户端的工具被上游自己执行了，
+        光要求「给结论」没用（它已经在上游沙箱里试过并失败了），必须要求它
+        **改用文字形态重新发起调用**，把调用交回客户端执行。
 
         返回 ``(resp, lease)``；失败返回 ``(None, None)``（调用方会把上一轮原样返回）。
         租约交给调用方释放，与主请求同一套生命周期，不会把账号永久占住。
         """
-        if leaked:
+        if hijacked:
+            nudge = (
+                "你刚才那几个工具调用被网页端自己执行了，而它们是本地客户端注册的工具，"
+                "必须由客户端执行才能拿到真实数据。现在请重新发起这些调用，并且"
+                "**只输出协议规定的文字形态调用行**，形如：\n"
+                '工具名({"参数名": 参数值})\n'
+                "行首直接是工具名，前面不要加方括号标记或任何前缀词；"
+                "不要输出 JSON 对象（{" + '"tool_calls"' + ": ...} 那种），"
+                "不要使用网页端自带的搜索/浏览工具，也不要只描述你打算做什么。"
+                f"\n需要重新调用的工具：{', '.join(hijacked)}"
+            )
+            if leaked:
+                nudge += f"\n\n你上一条的内容是：{leaked}"
+        elif leaked:
             nudge = (
                 "你上一条只写下了自己的打算，没有真正给出工具调用，也没有回答用户的问题。"
                 "现在不要再描述计划：请直接调用工具，或者直接给出面向用户的最终回答。"
@@ -2399,6 +2819,12 @@ def main() -> int:
         log(f"工具结果限体积：单条≤{config.tool_result_max_chars}字 / "
             f"网页类≤{config.web_result_max_chars}字 / 累计≤{config.tool_result_total_max_chars}字"
             f"（GLM_CLAMP_TOOL_RESULT=false 关闭）")
+    else:
+        log("工具结果限体积：已关闭，工具结果按原文回灌（GLM_CLAMP_TOOL_RESULT=true 可开启）")
+    if config.prompt_tool_calling:
+        budget = config.tools_prompt_max_chars
+        log(f"工具定义预算：{'不裁剪' if budget <= 0 else f'{budget} 字（超出部分仅列名字）'}"
+            f"（GLM_TOOLS_PROMPT_MAX_CHARS）")
     else:
         log("工具调用：未开启（GLM_PROMPT_TOOL_CALLING=true 可开启；客户端发来的 tools 会被忽略）")
     if config.networking:

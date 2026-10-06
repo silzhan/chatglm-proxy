@@ -62,7 +62,8 @@ def handle_messages(handler, glm) -> None:
     tools = normalize_tools(payload.get("tools"))
     stop_sequences = _stop_sequences(payload.get("stop_sequences"))
     openai_messages = to_openai_messages(payload.get("system"), messages)
-    tools_instructions = glm.render_tools_prompt(tools) if tools else ""
+    tools_instructions = (glm.render_tools_prompt(tools, handler.config.tools_prompt_max_chars)
+                          if tools else "")
     assistant_id = handler.config.model_assistant_map.get(model.lower(), "")
     input_tokens = estimate_input_tokens(openai_messages, tools_instructions)
     networking = _networking(payload, handler.config.networking)
@@ -124,7 +125,7 @@ def handle_count_tokens(handler, glm) -> None:
 
     tools = normalize_tools(payload.get("tools"))
     openai_messages = to_openai_messages(payload.get("system"), payload["messages"])
-    extra = glm.render_tools_prompt(tools) if tools else ""
+    extra = glm.render_tools_prompt(tools, handler.config.tools_prompt_max_chars) if tools else ""
     handler._json(200, {"input_tokens": estimate_input_tokens(openai_messages, extra)})
 
 
@@ -329,7 +330,8 @@ def _render_buffered(handler, glm, acc, model, stream: bool, tools: list,
                      want_thinking: bool, input_tokens: int, account, assistant_id: str,
                      stop_sequences: list | None = None) -> None:
     """把缓冲好的完整输出渲染成 Anthropic message —— 工具结果或普通回答都走这里。"""
-    text = acc.full_text()
+    text = glm.join_answer_parts(
+        acc.part_texts(), handler.config.strip_process_narration)
     reasoning = acc.full_reasoning() if want_thinking else ""
 
     calls = None

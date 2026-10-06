@@ -500,7 +500,7 @@ class PureLogicTest(unittest.TestCase):
             {"role": "user", "content": "要穿外套吗"},
         ]
         text = gp.convert_messages(messages)[0]["content"][0]["text"]
-        self.assertIn('[tool_call] get_weather({"city":"北京"})', text)
+        self.assertIn('get_weather({"city":"北京"})', text)  # 行首不带前缀（见 ToolProtocolHintTest）
         self.assertIn("Tool(get_weather): 晴 25 度", text)  # 工具名按 call_id 回填
         self.assertIn("User: 要穿外套吗", text)
 
@@ -530,7 +530,28 @@ class PureLogicTest(unittest.TestCase):
         )[0]["content"][0]["text"]
         self.assertIn("# TOOLS", text)
         self.assertIn("get_weather：查询指定城市的天气", text)
+        self.assertIn(gp.TOOL_FRAME_TAIL, text)
         self.assertTrue(text.endswith("Assistant: "))
+
+    def test_tools_protocol_follows_conversation(self):
+        """协议块必须在对话**之后**：放头部时被长 system prompt 埋掉，模型整块无视（真机）。"""
+        tools = gp.extract_tool_definitions({"tools": [WEATHER_TOOL]})
+        text = gp.convert_messages(
+            [{"role": "system", "content": "你是助手"}, {"role": "user", "content": "北京天气"}],
+            gp.render_tools_prompt(tools),
+        )[0]["content"][0]["text"]
+        self.assertLess(text.rindex("# INSTRUCTIONS"), text.rindex("# CONVERSATION"))
+        # index 而非 rindex：TOOL_FRAME_TAIL 里也写着「按上面 # TOOLS 的协议」，那处不是协议块起点
+        head = text.index("# TOOLS")
+        self.assertLess(text.rindex("# CONVERSATION"), head)
+        self.assertLess(head, text.rindex(gp.TOOL_FRAME_TAIL))
+        self.assertTrue(text.endswith("Assistant: "))
+
+    def test_no_tool_frame_tail_without_tools(self):
+        """没有协议块时不许出现「按上面 # TOOLS 的协议」—— 那会指向不存在的内容。"""
+        text = gp.convert_messages([{"role": "user", "content": "你好"}])[0]["content"][0]["text"]
+        self.assertNotIn(gp.TOOL_FRAME_TAIL, text)
+        self.assertNotIn("# TOOLS", text)
 
     def test_extract_tool_definitions(self):
         payload = {"tools": [WEATHER_TOOL, {"type": "web_search"}, {"type": "function"}]}
@@ -558,9 +579,10 @@ class PureLogicTest(unittest.TestCase):
             '好的：\n```json\n{"tool_calls":[{"name":"get_weather","arguments":{"city":"沪"}}]}\n```',
             allowed,
         ))
-        # 多个工具
+        # 多个工具（不同参数）—— 测的是「多重调用」都要保留，同名同参的重复项另有去重
         self.assertEqual(len(gp.parse_tool_calls(
-            '{"tool_calls":[{"name":"get_weather","arguments":{}},{"name":"get_weather","arguments":{}}]}',
+            '{"tool_calls":[{"name":"get_weather","arguments":{"city":"京"}},'
+            '{"name":"get_weather","arguments":{"city":"沪"}}]}',
             allowed,
         )), 2)
         # 尾随杂质：上游实测会在 {"tool_calls":[...]} 后再补一个 }（...}]}]}），
@@ -582,6 +604,59 @@ class PureLogicTest(unittest.TestCase):
         self.assertIsNone(gp.parse_tool_calls('{"tool_calls":[{"name":"rm_rf","arguments":{}}]}', allowed))
         self.assertIsNone(gp.parse_tool_calls('{"tool_calls":[{"name":"get_weather"', allowed))
         self.assertIsNone(gp.parse_tool_calls("", allowed))
+
+
+# ─────────────────────────── 重复调用去重 ───────────────────────────
+class DuplicateCallDedupeTest(unittest.TestCase):
+    """上游实测会把同一个工具块输出两遍（先是半截、最后是完整版）。
+
+    两处都能解析成合法调用，不去重客户端就执行两次 —— 写文件/发消息这类工具
+    重复执行有真实副作用，不是单纯的显示问题。
+    """
+
+    def test_identical_duplicate_calls_collapse_to_one(self):
+        calls = gp.parse_tool_calls(
+            '{"tool_calls":[{"name":"get_weather","arguments":{"city":"北京"}},'
+            '{"name":"get_weather","arguments":{"city":"北京"}}]}', {"get_weather"}
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "北京"})
+
+    def test_dedupe_keeps_the_first_call_id(self):
+        first = {"id": "call_1", "function": {"name": "t", "arguments": '{"a":1}'}}
+        second = {"id": "call_2", "function": {"name": "t", "arguments": '{"a":1}'}}
+        self.assertEqual([c["id"] for c in gp._dedupe_calls([first, second])], ["call_1"])
+
+    def test_argument_key_order_does_not_count_as_different(self):
+        left = {"function": {"name": "t", "arguments": '{"a":1,"b":2}'}}
+        right = {"function": {"name": "t", "arguments": '{"b":2,"a":1}'}}
+        self.assertEqual(len(gp._dedupe_calls([left, right])), 1)
+
+    def test_same_name_different_args_are_kept(self):
+        calls = gp.parse_tool_calls(
+            '{"tool_calls":[{"name":"get_weather","arguments":{"city":"北京"}},'
+            '{"name":"get_weather","arguments":{"city":"上海"}}]}', {"get_weather"}
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            [json.loads(c["function"]["arguments"])["city"] for c in calls], ["北京", "上海"]
+        )
+
+    def test_textual_duplicates_collapse(self):
+        calls = gp.parse_textual_tool_calls(
+            'get_weather({"city": "北京"})\nget_weather({"city": "北京"})', {"get_weather"}
+        )
+        self.assertEqual(len(calls), 1)
+
+    def test_duplicate_does_not_waste_a_slot(self):
+        """去重要在限数之前做：否则重复项白占一个额度，最后一个真调用被挤掉。"""
+        text = "\n".join([
+            'a({"x": 1})', 'a({"x": 1})',
+            'b({"x": 2})', 'c({"x": 3})', 'd({"x": 4})', 'e({"x": 5})',
+        ])
+        calls = gp.parse_textual_tool_calls(text, {"a", "b", "c", "d", "e"})
+        self.assertEqual(len(calls), gp.TEXTUAL_CALL_MAX)
+        self.assertEqual([c["function"]["name"] for c in calls], ["a", "b", "c", "d"])
 
 
 # ─────────────────────────── 流式增量（乱序/改写防护） ───────────────────────────
@@ -1273,6 +1348,45 @@ class HttpEndToEndTest(FakeUpstreamCase):
         # 工具协议确实注入了提示词，模型才知道能调什么
         self.assertIn("# TOOLS", json.loads(self.fake.bodies[-1])["messages"][0]["content"][0]["text"])
 
+    def test_prompt_puts_protocol_after_history_with_real_example(self):
+        """端到端：协议块在对话之后，且示例用的是客户端真实注册的工具名与必填参数。"""
+        self.config.prompt_tool_calling = True
+        tools = [{"type": "function", "function": {
+            "name": "read_file", "description": "读本地文件",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
+                           "required": ["path"]}}}]
+        self.fake.script = [("sse", sse_with_text("这里不需要工具，直接回答。"))]
+        status, _ = self.post_json(
+            {"model": "glm-4", "messages": [BUSY_REQUEST], "tools": tools}
+        )
+        self.assertEqual(status, 200)
+        prompt = json.loads(self.fake.bodies[-1])["messages"][0]["content"][0]["text"]
+        # 用 index 而非 rindex：生成提示里也提到「# TOOLS」，那处不是协议块的起点
+        head = prompt.index("# TOOLS")
+        self.assertLess(prompt.rindex("# CONVERSATION"), head)
+        self.assertLess(head, prompt.rindex(gp.TOOL_FRAME_TAIL))
+        self.assertIn('read_file({"path":', prompt)
+        self.assertTrue(prompt.endswith("Assistant: "))
+
+    def test_tool_mode_with_40_tools_and_budget(self):
+        """40 个胖 Schema + 小预算：定义被裁剪，但排在最后、参数没展开的工具仍要能被调用。"""
+        self.config.prompt_tool_calling = True
+        self.config.tools_prompt_max_chars = 4000
+        tools = ToolsPromptBudgetTest.fat_tools(40)
+        self.fake.script = [("sse", sse_with_text(
+            '{"tool_calls":[{"name":"tool_39","arguments":{"query":"北京"}}]}'
+        ))]
+        status, data = self.post_json(
+            {"model": "glm-4", "messages": [BUSY_REQUEST], "tools": tools}
+        )
+        self.assertEqual(status, 200)
+        choice = data["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(choice["message"]["tool_calls"][0]["function"]["name"], "tool_39")
+        prompt = json.loads(self.fake.bodies[-1])["messages"][0]["content"][0]["text"]
+        self.assertIn("未展开的工具（参数请勿猜测，猜了必失败）：", prompt)
+        self.assertLess(prompt.count("参数 JSON Schema"), 40)
+
     def test_tool_mode_stream_returns_tool_calls(self):
         self.config.prompt_tool_calling = True
         self.fake.script = [("sse", sse_with_text(
@@ -1421,6 +1535,28 @@ class HttpEndToEndTest(FakeUpstreamCase):
             json.loads(call["function"]["arguments"]),
             {"name": "writeFile", "params": {"path": "./a.txt", "content": "你好"}},
         )
+
+    def test_tool_mode_rescues_windows_path_arguments(self):
+        """真机高频畸形：模型把 Windows 路径的反斜杠只写一个 → 整段 JSON 非法 →
+        以前这条工具链直接作废（日志里看不出原因）。现在要救回参数完整的调用。"""
+        self.config.prompt_tool_calling = True
+        path = "C:\\Users\\silzh\\docs\\STATE.md"
+        self.fake.script = [("sse", sse_with_text(
+            '{"tool_calls":[{"name":"read_file","arguments":{"path":"' + path + '"}}]}'))]
+        status, data = self.post_json({
+            "model": "glm-5.3", "messages": [BUSY_REQUEST],
+            "tools": [{"type": "function", "function": {
+                "name": "read_file", "description": "读取文件",
+                "parameters": {"type": "object",
+                               "properties": {"path": {"type": "string"}},
+                               "required": ["path"]}}}],
+        })
+        self.assertEqual(status, 200)
+        choice = data["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(
+            json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]),
+            {"path": path})
 
     def test_tool_mode_falls_back_to_plain_answer(self):
         """模型没调工具（或工具名不认识）时，必须退化成普通回答，不能瞎报 tool_calls。"""
@@ -1697,6 +1833,23 @@ class AnthropicEndToEndTest(FakeUpstreamCase):
         self.assertIn("你是猫娘", prompt)
         self.assertIn("User: 你好", prompt)
 
+    def test_tools_protocol_block_follows_conversation(self):
+        """Anthropic 面共用同一条渲染路径：协议块也要排在对话之后、示例用真工具名。"""
+        status, _ = self.post({
+            "model": "glm-4", "system": "你是助手",
+            "messages": [{"role": "user", "content": "北京天气"}],
+            "tools": [{"name": "get_weather", "description": "查天气",
+                       "input_schema": {"type": "object",
+                                         "properties": {"city": {"type": "string"}},
+                                         "required": ["city"]}}],
+        })
+        self.assertEqual(status, 200)
+        prompt = json.loads(self.fake.bodies[-1])["messages"][0]["content"][0]["text"]
+        head = prompt.index("# TOOLS")   # index 而非 rindex：生成提示里也提到 # TOOLS
+        self.assertLess(prompt.rindex("# CONVERSATION"), head)
+        self.assertLess(head, prompt.rindex(gp.TOOL_FRAME_TAIL))
+        self.assertIn('get_weather({"city": "北京"})', prompt)
+
     def test_stream_event_sequence(self):
         events = self.post_stream({
             "model": "glm-4", "stream": True,
@@ -1875,7 +2028,7 @@ class AnthropicEndToEndTest(FakeUpstreamCase):
         })
         self.assertEqual(status, 200)
         prompt = json.loads(self.fake.bodies[-1])["messages"][0]["content"][0]["text"]
-        self.assertIn("[tool_call] get_weather", prompt)
+        self.assertIn("get_weather({", prompt)
         self.assertIn("Tool(get_weather): 晴 25 度", prompt)
         self.assertEqual(data["content"], [{"type": "text", "text": "北京今天晴，25 度。"}])
 
@@ -2088,6 +2241,55 @@ class UnescapedQuoteJsonTest(unittest.TestCase):
         self.assertIsNone(gp.parse_tool_calls('{"name":"x","arguments":{"code":' + '""' * 400,
                                               {"x"}))
         self.assertLess(time.time() - started, 2.0)
+
+
+class WindowsPathAndFullwidthJsonTest(unittest.TestCase):
+    """两类以前一定解析失败的畸形参数（借 dsh-glm-web 的真机教训补的抢救）。
+
+    ① Windows 路径：模型写 ``{"path": "C:\\Users\\x"}`` 时反斜杠只写了一个 ——
+       ``\\U``/``\\x`` 不是合法 JSON 转义，整段非法，调用退化成散文，日志看不出原因。
+    ② 全角引号：中文模型常把 JSON 的定界符写成 ``“ ”``。
+    """
+
+    PATH = "C:\\Users\\silzh\\docs\\STATE.md"
+    TOOLS = {"read_file", "get_weather"}
+
+    def json_body(self) -> str:
+        return ('{"tool_calls":[{"name":"read_file","arguments":{"path":"'
+                + self.PATH + '"}}]}')
+
+    def test_the_raw_text_is_really_invalid(self):
+        """先确认场景成立：这段必须让 json.loads 报错，否则整组测试在测空气。"""
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(self.json_body())
+
+    def test_single_backslash_path_is_rescued(self):
+        calls = gp.parse_tool_calls(self.json_body(), self.TOOLS)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["path"], self.PATH)
+
+    def test_textual_call_with_windows_path_is_rescued(self):
+        """文字形态（协议要求的写法）走的是另一条解析链，同样得救回来。"""
+        calls = gp.parse_textual_tool_calls('read_file({"path": "%s"})' % self.PATH, self.TOOLS)
+        self.assertEqual([c["function"]["name"] for c in calls or []], ["read_file"])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["path"], self.PATH)
+
+    def test_fullwidth_quotes_are_rescued(self):
+        raw = "{“tool_calls”:[{“name”:“get_weather”,“arguments”:{“city”:“北京”}}]}"
+        calls = gp.parse_tool_calls(raw, self.TOOLS)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "北京"})
+
+    def test_escape_fix_is_idempotent_on_valid_json(self):
+        """本来就写对的 JSON 不能越修越错（\\n、\\"、\\\\ 都不该被再翻一倍）。"""
+        good = json.dumps({"path": self.PATH, "code": 'x = "a"\n'}, ensure_ascii=False)
+        self.assertEqual(gp._fix_invalid_escapes(good), good)
+
+    def test_truncated_path_is_still_refused(self):
+        """红线不破：路径写到一半就断，补齐只会长出一个参数被腰斩的假调用 —— 必须拒绝。"""
+        self.assertIsNone(gp.parse_tool_calls(
+            '{"tool_calls":[{"name":"read_file","arguments":{"path":"' + 'C:\\Users\\sil',
+            self.TOOLS))
 
 
 class ToolMissLogTest(unittest.TestCase):
@@ -2480,6 +2682,365 @@ class ThinkLeakEndToEndTest(FakeUpstreamCase):
         # 首次 + 1 次续问 = 2 次，不多打
         self.assertEqual(self.fake.stream_calls, 2)
         # 关键：账号槽位必须已归还，否则后续请求会一直排队到超时
+        self.assertTrue(self.accounts[0].try_acquire(), "续问后账号槽位应已释放")
+        self.accounts[0].release()
+
+
+class ThinkLeakCopiedReasoningTest(unittest.TestCase):
+    """形态 D：上游把思维链**原样复制**进正文槽（实测正文 493 字 == 思维链 493 字）。
+
+    这段是真实漏判：措辞是「Let me search / Now let me search」，一条都不在
+    THINK_LEAK_PHRASES 里，于是裸思维链被当成答案发给了客户端。
+    """
+
+    LEAKED = (
+        'The user is asking "cpa怎么安装ClinePassBridge" - which translates to '
+        '"how to install ClinePassBridge for cpa". This seems to be about installing '
+        'some tool called "ClinePassBridge". Let me search for this to get current information.\n\n'
+        'Actually, "cpa" might refer to CherryStudio\'s Claude Pass Bridge or something '
+        'similar. Let me search the web for "ClinePassBridge" to understand what it is and '
+        'how to install it.\n\nI already inspected the tavilySearch tool. '
+        'Now let me search for "ClinePassBridge".'
+    )
+
+    def test_copied_reasoning_is_the_signal_that_catches_it(self):
+        """措辞补全也救不了这条：它以句号收尾，短语门槛要求「话被截断」才判定。
+
+        真正拦住它的是不依赖措辞的「思考副本」硬信号 —— 这就是为什么那条判定
+        必须排在短语表门槛之前，而不是像早先那样写在门槛之后走不到。
+        """
+        self.assertFalse(gp.looks_like_think_leak(self.LEAKED, ""))
+        self.assertTrue(gp.looks_like_think_leak(self.LEAKED, self.LEAKED))
+
+    def test_copied_reasoning_is_flagged(self):
+        self.assertTrue(gp.looks_like_think_leak(self.LEAKED, self.LEAKED))
+
+    def test_partial_overlap_with_reasoning_is_flagged(self):
+        reason = self.LEAKED + "\n\n然后我就直接收尾了，什么结论都没给。"
+        self.assertTrue(gp.looks_like_think_leak(self.LEAKED, reason))
+
+    def test_short_answer_mentioned_in_reasoning_is_not_flagged(self):
+        """短回答整段出现在思考里是常态（「好的。」），不能按副本误杀。"""
+        self.assertFalse(gp.looks_like_think_leak("好的。", "好的，我先确认一下工具参数怎么填。"))
+
+    def test_new_phrases_catch_unterminated_monologue(self):
+        """补进去的措辞：话说到一半（无收尾标点）也要判定。"""
+        self.assertTrue(gp.looks_like_think_leak(
+            "The user wants the install steps. Let me search the official docs", ""))
+
+
+class ProcessNarrationTest(unittest.TestCase):
+    """上游 agent 分步消息里的「我再进一步查找…」不该混进答案。"""
+
+    ANSWER = (
+        "## 北京景点人数情况\n\n中秋假期市属公园接待游客约 25.13 万人次，"
+        "天坛公园、颐和园、北海公园游客量位列前三，建议错峰出行。"
+    )
+    NARRATIONS = [
+        "北京旅游网首页已成功打开，可以看到一些中秋·国庆期间的游客数据。"
+        "我再进一步查找今天各景区的实时人数信息。",
+        "园林局官网已打开，但没有直接的今日实时客流数据。"
+        "我再尝试通过搜索引擎和热门景区（如故宫、颐和园）官网查具体数据。",
+    ]
+
+    def test_narration_parts_are_dropped(self):
+        text = gp.join_answer_parts([self.ANSWER] + self.NARRATIONS)
+        self.assertEqual(text, self.ANSWER)
+        self.assertNotIn("我再进一步查找", text)
+
+    def test_genuine_multi_part_answer_survives_intact(self):
+        """按段落切片的正常回答，一份都不能丢。"""
+        parts = ["整体情况如下。", "客流方面，市属公园昨日接待 67 万人次。", "建议早上入园。"]
+        self.assertEqual(gp.join_answer_parts(parts), "\n\n".join(parts))
+
+    def test_digit_bearing_part_is_never_treated_as_narration(self):
+        self.assertFalse(gp.is_process_narration("我再查一次，结果是 12 万人次。"))
+
+    def test_all_narration_falls_back_to_original(self):
+        """全是旁白时宁可原样返回，也不能把内容吃干净。"""
+        self.assertEqual(gp.join_answer_parts(self.NARRATIONS),
+                         "\n\n".join(self.NARRATIONS))
+
+    def test_flag_off_keeps_everything(self):
+        text = gp.join_answer_parts([self.ANSWER] + self.NARRATIONS, strip_narration=False)
+        self.assertIn("我再进一步查找", text)
+
+    def test_parts_join_in_arrival_order_not_string_sort(self):
+        """logic_id 是 p1…p9、p10 时，字符串排序会把 'p10' 排到 'p9' 前面。"""
+        acc = gp.StreamAccumulator()
+        acc.consume(sse_event("甲", logic_id="p10"))
+        acc.consume(sse_event("乙", logic_id="p9"))
+        self.assertEqual(acc.full_text(), "甲\n\n乙")
+        self.assertEqual(acc.part_texts(), ["甲", "乙"])
+
+
+class PlatformToolResultTest(unittest.TestCase):
+    """上游自带工具的结果只喂给上游模型，代理必须落一头日志，否则无从定责。"""
+
+    def test_result_is_paired_by_call_id(self):
+        part = {"logic_id": "p1", "content": [
+            {"type": "tool_calls", "tool_calls": {
+                "id": "c1", "name": "mcp__CherryHub__exec", "arguments": "{}"}},
+            {"type": "tool_result", "tool_result": {"id": "c1", "content": "unknown tool call"}},
+        ]}
+        self.assertEqual(gp._platform_tool_calls(part),
+                         [("mcp__CherryHub__exec", "unknown tool call")])
+
+    def test_result_is_paired_by_position_when_ids_are_missing(self):
+        part = {"logic_id": "p1", "content": [
+            {"type": "tool_calls", "tool_calls": {"name": "search", "arguments": "{}"}},
+            {"type": "tool_result", "tool_result": {"content": "北京今天晴"}},
+        ]}
+        self.assertEqual(gp._platform_tool_calls(part), [("search", "北京今天晴")])
+
+    def test_result_head_is_recorded_on_accumulator(self):
+        acc = gp.StreamAccumulator()
+        acc.consume({"conversation_id": "c1", "status": "generating", "parts": [
+            {"logic_id": "p1", "content": [
+                {"type": "tool_calls", "tool_calls": {"id": "c1", "name": "open_url"}},
+                {"type": "tool_result", "tool_result": {"id": "c1", "content": "页面内容"}},
+            ]}]})
+        self.assertEqual(acc.platform_tools, ["open_url"])
+        self.assertEqual(acc.platform_results, ["open_url → 页面内容"])
+
+
+class ToolProtocolHintTest(unittest.TestCase):
+    """协议与回灌历史必须是同一种形态，否则模型在两种写法之间来回摆。"""
+
+    def test_prompt_instructs_the_textual_form_used_in_history(self):
+        tools = gp.extract_tool_definitions({"tools": [WEATHER_TOOL]})
+        prompt = gp.render_tools_prompt(tools)
+        self.assertIn("# TOOLS", prompt)
+        self.assertIn('工具名({"参数名": "参数值"})', prompt)
+        # 历史渲染（render_tool_calls）用的就是这个形态，两边要对得上
+        rendered = gp.render_tool_calls(
+            {"tool_calls": [{"id": "c1", "function": {"name": "get_weather",
+                                                      "arguments": '{"city":"北京"}'}}]}, {})
+        self.assertEqual(rendered, 'get_weather({"city":"北京"})')
+
+    def test_no_bracketed_marker_is_emitted(self):
+        """实测带方括号的调用前缀会被网页端按它自己的工具语法吃掉（连同半截工具名一起吞，
+        回来的报错是「unknown tool call,tool_call] mcp__X__invoke」）。协议与历史都不许再写。"""
+        prompt = gp.render_tools_prompt(gp.extract_tool_definitions({"tools": [WEATHER_TOOL]}))
+        self.assertNotIn("[tool_call]", prompt)
+        rendered = gp.render_tool_calls(
+            {"tool_calls": [{"id": "c1", "function": {"name": "get_weather", "arguments": "{}"}}]}, {})
+        self.assertNotIn("[", rendered)
+
+    def test_prefix_free_call_line_still_parsed(self):
+        """去掉前缀后兜底翻译仍要认得，否则整条 MCP 链路会断在这里。"""
+        calls = gp.parse_textual_tool_calls('get_weather({"city": "北京"})', {"get_weather"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+
+    def test_legacy_bracketed_line_is_still_tolerated(self):
+        """模型惯性（以及旧会话历史里的旧写法）仍可能带方括号前缀，解析要照旧认得。"""
+        calls = gp.parse_textual_tool_calls(
+            '[tool_call] get_weather({"city": "北京"})', {"get_weather"})
+        self.assertEqual([c["function"]["name"] for c in calls], ["get_weather"])
+
+    def test_json_shape_is_discouraged(self):
+        """{"tool_calls": [...]} 会被网页端当成它自带的工具拦下执行 —— 提示里必须明令禁止。"""
+        tools = gp.extract_tool_definitions({"tools": [WEATHER_TOOL]})
+        self.assertIn("会被网页端", gp.render_tools_prompt(tools))
+
+    def test_example_uses_a_real_declared_tool(self):
+        """示例必须用本会话真实存在的工具名 + 真实必填参数。
+
+        真机教训：示例写抽象名字时，模型照抄形状却把必填参数漏掉（实测产出 ``invoke({})``）。
+        """
+        tools = gp.extract_tool_definitions({"tools": [{
+            "type": "function", "function": {
+                "name": "read_file", "description": "读本地文件",
+                "parameters": {"type": "object",
+                               "properties": {"path": {"type": "string"}},
+                               "required": ["path"]}},
+        }]})
+        prompt = gp.render_tools_prompt(tools)
+        self.assertIn('read_file({"path": "./a.txt"})', prompt)
+        self.assertIn("正确示例", prompt)
+
+    def test_counterexamples_present(self):
+        tools = gp.extract_tool_definitions({"tools": [WEATHER_TOOL]})
+        prompt = gp.render_tools_prompt(tools)
+        self.assertIn("常见错误", prompt)
+        self.assertIn("漏参数：get_weather({})", prompt)
+        self.assertIn("上面列表之外的任何工具名在本端都不存在", prompt)
+        # 示例段本身不能带方括号（方括号前缀会被上游自己的工具语法吃掉）
+        self.assertIn('编造工具名：open_url({"q": "示例值"})', prompt)
+
+    def test_counterexample_never_names_a_declared_tool(self):
+        """反例里的「编造工具名」不能恰好是客户端真注册的工具，否则反例会劝退真调用。"""
+        tools = gp.extract_tool_definitions({"tools": [{
+            "type": "function", "function": {
+                "name": "open_url", "description": "打开网页",
+                "parameters": {"type": "object",
+                               "properties": {"url": {"type": "string"}},
+                               "required": ["url"]}},
+        }]})
+        prompt = gp.render_tools_prompt(tools)
+        self.assertNotIn("编造工具名：open_url(", prompt)
+        self.assertIn("编造工具名：search_web(", prompt)
+
+    def test_example_skipped_when_required_params_are_unsafe_to_guess(self):
+        """必填参数多于一个就别举例：半截示例比没有示例更坏。"""
+        tools = gp.extract_tool_definitions({"tools": [{
+            "type": "function", "function": {
+                "name": "invoke", "description": "调用 MCP 工具",
+                "parameters": {"type": "object",
+                               "properties": {"name": {"type": "string"},
+                                              "params": {"type": "object"}},
+                               "required": ["name", "params"]}},
+        }]})
+        prompt = gp.render_tools_prompt(tools)
+        self.assertNotIn("正确示例", prompt)
+        self.assertNotIn("常见错误", prompt)
+        self.assertIn('工具名({"参数名": "参数值"})', prompt)   # 抽象占位行仍保留
+
+
+class ToolsPromptBudgetTest(unittest.TestCase):
+    """几十个 MCP Schema 全量塞进提示词，会把「协议本身」埋掉（真机：模型无视格式、编工具名）。"""
+
+    @staticmethod
+    def fat_tools(count: int = 20) -> list[dict]:
+        return gp.extract_tool_definitions({"tools": [
+            {"type": "function", "function": {
+                "name": f"tool_{i}", "description": f"第 {i} 个工具",
+                "parameters": {"type": "object", "properties": {
+                    "query": {"type": "string", "description": "关键词" * 300},
+                    "mode": {"type": "string", "enum": [f"v{j}" for j in range(120)]}},
+                "required": ["query"]}}}
+            for i in range(count)]})
+
+    def test_definitions_are_trimmed_but_protocol_is_not(self):
+        tools = self.fat_tools()
+        full = gp.render_tools_prompt(tools, max_chars=0)
+        trimmed = gp.render_tools_prompt(tools, max_chars=4000)
+        self.assertLess(len(trimmed), len(full) / 3)
+        # 协议说明永远全文保留（它才是被埋掉的那部分）
+        for marker in ("# TOOLS", "行首硬要求", "形状硬要求", "正确示例"):
+            self.assertIn(marker, trimmed)
+        self.assertLess(trimmed.count("参数 JSON Schema"), len(tools))
+
+    def test_omitted_tools_are_still_listed_by_name(self):
+        trimmed = gp.render_tools_prompt(self.fat_tools(), max_chars=4000)
+        self.assertIn("未展开的工具（参数请勿猜测，猜了必失败）：", trimmed)
+        self.assertIn("tool_19", trimmed)              # 名字还在（模型得知道它存在）
+        self.assertNotIn("- tool_19：", trimmed)        # 但参数不展开
+        self.assertIn("仅列名字", trimmed)
+
+    def test_budget_zero_disables_trimming(self):
+        prompt = gp.render_tools_prompt(self.fat_tools(), max_chars=0)
+        self.assertNotIn("未展开的工具", prompt)
+        self.assertEqual(prompt.count("- tool_"), 20)
+
+    def test_trimmed_tool_is_still_parsable(self):
+        """裁剪只影响提示词：被省略参数的工具照样要能被调用。"""
+        tools = self.fat_tools()
+        allowed = {t["name"] for t in tools}
+        self.assertNotIn("- tool_19：", gp.render_tools_prompt(tools, max_chars=4000))
+        calls = gp.parse_tool_calls(
+            '{"tool_calls":[{"name":"tool_19","arguments":{"query":"北京"}}]}', allowed)
+        self.assertEqual(calls[0]["function"]["name"], "tool_19")
+
+
+def sse_hijack(tool_name: str, result: str, answer: str) -> str:
+    """造一段「上游把客户端的工具抢去自己执行了」的 SSE。"""
+    part = {"logic_id": "p1", "content": [
+        {"type": "tool_calls", "tool_calls": {
+            "id": "c1", "name": tool_name, "arguments": "{}"}},
+        {"type": "tool_result", "tool_result": {"id": "c1", "content": result}},
+        {"type": "text", "text": answer},
+    ]}
+    return (
+        'data: %s\n\n'
+        'data: {"conversation_id":"conv-1","parts":[],"status":"finish"}\n\n'
+    ) % json.dumps({"conversation_id": "conv-1", "parts": [part],
+                    "status": "generating"}, ensure_ascii=False)
+
+
+class UpstreamHijackEndToEndTest(FakeUpstreamCase):
+    """上游抢跑客户端工具：这一轮不能当「模型选择直接回答」返回，必须续问重试。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.config = make_config(server_api_keys=["secret"], networking=False,
+                                  tool_continue_tries=2)
+        self.accounts = [gp.Account(self.config, "账号1", "seed-1", gp.TokenStore("", False))]
+        self.pool = gp.AccountPool(self.config, self.accounts)
+        self.client = gp.GLMClient(self.config, self.pool)
+        self._saved = (gp.Handler.config, gp.Handler.client)
+        gp.Handler.config = self.config
+        gp.Handler.client = self.client
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), gp.Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        gp.Handler.config, gp.Handler.client = self._saved
+        super().tearDown()
+
+    def post(self, payload: dict):
+        req = urllib.request.Request(
+            self.base + "/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+
+    def test_mangled_hijack_name_is_still_detected(self):
+        """上游按它自己的语法把 `[tool_` 吞掉后，回传的调用名只剩半截 —— 仍要认出是抢跑。"""
+        self.fake.script = [
+            ("sse", sse_hijack("tool_call] get_weather", "unknown tool call",
+                               "工具调用的格式错了，我换个写法。")),
+            ("sse", sse_with_text('get_weather({"city": "北京"})')),
+        ]
+        status, data = self.post({
+            "model": "glm-4",
+            "messages": [{"role": "user", "content": "北京今天景区人多吗"}],
+            "tools": [WEATHER_TOOL],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(data["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(self.fake.stream_calls, 2)
+
+    def test_hijacked_call_is_reasked_then_dispatched(self):
+        self.fake.script = [
+            # 第一轮：模型写的调用被上游执行了，客户端拿到的是上游沙箱里的失败结果
+            ("sse", sse_hijack("get_weather", "unknown tool call",
+                               "由于查询渠道受限，实时数据未能获取，建议查看官方渠道。")),
+            # 第二轮：改用无标记的文字形态（行首直接是工具名），客户端的工具这才真正跑起来
+            ("sse", sse_with_text('get_weather({"city": "北京"})')),
+        ]
+        status, data = self.post({
+            "model": "glm-4",
+            "messages": [{"role": "user", "content": "北京今天景区人多吗"}],
+            "tools": [WEATHER_TOOL],
+        })
+        self.assertEqual(status, 200)
+        choice = data["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(choice["message"]["tool_calls"][0]["function"]["name"], "get_weather")
+        self.assertEqual(self.fake.stream_calls, 2)
+
+    def test_hijack_retries_are_bounded_and_lease_released(self):
+        self.config.tool_continue_tries = 1
+        self.fake.script = [
+            ("sse", sse_hijack("get_weather", "unknown tool call", "渠道受限。")),
+            ("sse", sse_hijack("get_weather", "unknown tool call", "渠道受限。")),
+        ]
+        status, data = self.post({
+            "model": "glm-4",
+            "messages": [{"role": "user", "content": "北京今天景区人多吗"}],
+            "tools": [WEATHER_TOOL],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.stream_calls, 2)
         self.assertTrue(self.accounts[0].try_acquire(), "续问后账号槽位应已释放")
         self.accounts[0].release()
 
