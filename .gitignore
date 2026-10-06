@@ -1,0 +1,10 @@
+# 凭据与本地缓存，切勿提交
+.env
+.glm_tokens.json
+.glm_tokens.json.tmp
+__pycache__/
+*.pyc
+
+# 启动脚本产生的运行日志
+server.log
+server.err
