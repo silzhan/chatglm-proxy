@@ -2373,6 +2373,46 @@ class WindowsPathAndFullwidthJsonTest(unittest.TestCase):
         good = json.dumps({"path": self.PATH, "code": 'x = "a"\n'}, ensure_ascii=False)
         self.assertEqual(gp._fix_invalid_escapes(good), good)
 
+    # 真机事故（be-xigua 那一轮）：模型把路径原样贴进参数，反斜杠只写一个。
+    # 只修「非法转义」不够 —— 同一条路径里的 \b/\n/\t **是**合法 JSON 转义，
+    # 会被解释成控制字符吃掉字母，客户端报「文件不存在」，模型随即声称
+    # 「调用名被系统篡改」并凭记忆把答案编完。见 _fix_json_string 的字面量模式。
+    EATEN_PATH = r"E:\github\be-xigua\package.json"
+    QUIET_PATH = r"C:\bob\file.txt"          # 段名全撞上合法转义，连非法转义都没有
+
+    def body_of(self, path: str) -> str:
+        return ('{"tool_calls":[{"name":"read_file","arguments":{"path":"' + path + '"}}]}')
+
+    def assert_path_survives(self, raw: str, path: str) -> None:
+        calls = gp.parse_tool_calls(raw, self.TOOLS)
+        self.assertEqual(len(calls), 1, raw)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["path"], path)
+
+    def test_letter_eating_escape_in_path_is_not_eaten(self):
+        self.assert_path_survives(self.body_of(self.EATEN_PATH), self.EATEN_PATH)
+
+    def test_all_valid_escape_path_is_not_eaten(self):
+        self.assert_path_survives(self.body_of(self.QUIET_PATH), self.QUIET_PATH)
+
+    def test_textual_call_keeps_the_path(self):
+        """协议要求的文字形态是另一条解析链，同样不许吃字母。"""
+        calls = gp.parse_textual_tool_calls(f'read_file({{"path": "{self.EATEN_PATH}"}})',
+                                            self.TOOLS)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["path"], self.EATEN_PATH)
+
+    def test_path_inside_a_shell_command_is_not_eaten(self):
+        raw = ('{"tool_calls":[{"name":"read_file","arguments":'
+               '{"command":"del C:\\backup\\file.txt"}}]}')
+        calls = gp.parse_tool_calls(raw, self.TOOLS)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["command"],
+                         r"del C:\backup\file.txt")
+
+    def test_real_newline_in_a_command_stays_a_newline(self):
+        """反过来：没有盘符路径、也没有非法转义时，\\n 就是模型真的要的换行，不能改。"""
+        raw = ('{"tool_calls":[{"name":"read_file","arguments":{"command":"echo a\\nb"}}]}')
+        calls = gp.parse_tool_calls(raw, self.TOOLS)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["command"], "echo a\nb")
+
     def test_truncated_path_is_still_refused(self):
         """红线不破：路径写到一半就断，补齐只会长出一个参数被腰斩的假调用 —— 必须拒绝。"""
         self.assertIsNone(gp.parse_tool_calls(
@@ -3112,6 +3152,32 @@ def sse_hijack(tool_name: str, result: str, answer: str) -> str:
                     "status": "generating"}, ensure_ascii=False)
 
 
+class HijackNameCleaningTest(unittest.TestCase):
+    """上游回传的「工具名」是它自己语法吞剩的碎片，认出抢跑全靠这几种形态。"""
+
+    ALLOWED = {"Bash", "Read", "Grep", "mcp__CherryHub__invoke"}
+
+    def test_whole_call_dumped_into_the_name(self):
+        """真机（22:02:30）：整条 Bash 调用连参数一起塞进 name，工具名只占开头。"""
+        self.assertEqual(gp.hijacked_client_tools(
+            ['Bash({"command": "ls -la /e/github/be-xigua/"})</arg_value>'], self.ALLOWED),
+            ["Bash"])
+
+    def test_bracket_fragment_still_maps(self):
+        self.assertEqual(gp.hijacked_client_tools(
+            ["tool_call] mcp__CherryHub__invoke"], self.ALLOWED), ["mcp__CherryHub__invoke"])
+
+    def test_hashed_residue_counts_as_blind_hijack(self):
+        """真机（22:05:58）：上游把名字换成自己编的散列，认不出工具但确实是吃了调用。"""
+        self.assertEqual(gp.unattributed_hijacks(
+            ["tool_9a822147</arg_value>", "finish", "Bash"], self.ALLOWED),
+            ["tool_9a822147</arg_value>"])
+
+    def test_benign_platform_tool_names_are_not_residue(self):
+        self.assertEqual(gp.unattributed_hijacks(
+            ["finish", "search", "execute_sandbox_code", "Glob"], self.ALLOWED), [])
+
+
 class UpstreamHijackEndToEndTest(FakeUpstreamCase):
     """上游抢跑客户端工具：这一轮不能当「模型选择直接回答」返回，必须续问重试。"""
 
@@ -3196,6 +3262,37 @@ class UpstreamHijackEndToEndTest(FakeUpstreamCase):
         self.assertEqual(self.fake.stream_calls, 2)
         self.assertTrue(self.accounts[0].try_acquire(), "续问后账号槽位应已释放")
         self.accounts[0].release()
+
+    def test_blind_hijack_is_reasked(self):
+        """上游连名字都不回传（换成它自己编的散列）时也要续问 ——
+        否则这一轮会被当成「模型选择直接回答」，把模型凭记忆编的答案发给客户端。"""
+        self.fake.script = [
+            ("sse", sse_hijack("tool_9a822147</arg_value>", "",
+                               "工具名被篡改了，我按已读到的内容直接给结论。")),
+            ("sse", sse_with_text('get_weather({"city": "北京"})')),
+        ]
+        status, data = self.post({
+            "model": "glm-4",
+            "messages": [{"role": "user", "content": "北京今天景区人多吗"}],
+            "tools": [WEATHER_TOOL],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(data["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(self.fake.stream_calls, 2)
+
+    def test_plain_platform_tool_does_not_reask(self):
+        """上游自己的 finish/search 不算抢跑：正常文字回答只发一次请求。"""
+        self.fake.script = [
+            ("sse", sse_hijack("search", "北京 晴 21 度", "北京今天晴，21 度，适合出门。")),
+        ]
+        status, data = self.post({
+            "model": "glm-4",
+            "messages": [{"role": "user", "content": "北京天气怎么样"}],
+            "tools": [WEATHER_TOOL],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(self.fake.stream_calls, 1)
+        self.assertEqual(data["choices"][0]["finish_reason"], "stop")
 
 
 if __name__ == "__main__":

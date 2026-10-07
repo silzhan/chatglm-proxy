@@ -1525,6 +1525,56 @@ def _loads_with_inner_quote_fix(text: str, start: int) -> dict | None:
 
 
 _VALID_JSON_ESCAPES = '"\\/bfnrtu'
+# 单反斜杠的盘符路径（``C:\Users``，后面紧跟的不是又一个反斜杠）：
+# 出现它说明模型贴的是路径原文，一个反斜杠都不能当 JSON 转义解释
+_DRIVE_PATH = re.compile(r"[A-Za-z]:\\[^\\\"]")
+
+
+def _has_invalid_escape(body: str) -> bool:
+    index, size = 0, len(body)
+    while index < size:
+        if body[index] != "\\":
+            index += 1
+            continue
+        nxt = body[index + 1] if index + 1 < size else ""
+        if nxt and nxt not in _VALID_JSON_ESCAPES:
+            return True
+        index += 2
+    return False
+
+
+def _fix_json_string(body: str) -> str:
+    """修一个 JSON 字符串字面量**内部**的反斜杠。
+
+    两种形态触发「整个值都按字面反斜杠处理」（实测比逐个转义判断准得多）：
+      * 值里有任一非法转义（``E:\\github`` 的 ``\\g``）—— 说明模型根本不是在写 JSON 转义，
+        它就是把路径原样贴进来了，于是同一段里的 ``\\b``/``\\n``/``\\t`` 也一律按字面处理；
+      * 值里出现单反斜杠的盘符路径（``del C:\\backup\\file``）—— 段名全撞上合法转义
+        （``C:\\bob\\file``）时只有这条认得出来。
+    """
+    literal_mode = bool(_DRIVE_PATH.search(body)) or _has_invalid_escape(body)
+    out: list[str] = []
+    index, size = 0, len(body)
+    while index < size:
+        ch = body[index]
+        if ch != "\\":
+            out.append(ch)
+            index += 1
+            continue
+        nxt = body[index + 1] if index + 1 < size else ""
+        if nxt in ("\\", '"'):              # 已经是一对合法转义，整体带走
+            out.append("\\" + nxt)
+            index += 2
+        elif nxt == "":                     # 末尾孤立反斜杠：原样
+            out.append(ch)
+            index += 1
+        elif literal_mode or nxt not in _VALID_JSON_ESCAPES:
+            out.append("\\\\" + nxt)        # 单反斜杠 → 双反斜杠
+            index += 2
+        else:
+            out.append(ch + nxt)            # 合法转义：原样
+            index += 2
+    return "".join(out)
 
 
 def _fix_invalid_escapes(text: str) -> str:
@@ -1538,28 +1588,52 @@ def _fix_invalid_escapes(text: str) -> str:
     纯正则会看到「第二个反斜杠后面跟着 ``U``」就把已经写对的内容再补一遍，
     越修越多（本函数的第一版就是这么写错的，测试 ``test_escape_fix_is_idempotent`` 拦住了它）。
 
-    残留坑（同类实现也一样，先记着别硬修）：``C:\\new\\test`` 里的 ``\\n``/``\\t``
-    **是**合法转义，会被静默解释成换行/制表符而吃掉字母；``\\uXXXX`` 同理。
+    也只可能**按字符串字面量逐段处理**：整段一起扫分不清键与值，而「这条值算不算路径」
+    必须以值为单位判断。
+
+    以前的残留坑（真机事故：Read 一个 Windows 路径吃掉一个字母，客户端报「文件不存在」，
+    模型改口说「调用名被系统篡改」并凭记忆编完答案）：光修非法转义时，同一条路径里
+    ``\\b``/``\\n``/``\\t`` **是**合法 JSON 转义，会被静默解释成控制字符而吃掉字母 ——
+    现在由 ``_fix_json_string`` 的字面量模式一起兜住。
     """
     out: list[str] = []
     index, size = 0, len(text)
     while index < size:
-        ch = text[index]
-        if ch != "\\":
-            out.append(ch)
+        if text[index] != '"':
+            out.append(text[index])
             index += 1
             continue
-        nxt = text[index + 1] if index + 1 < size else ""
-        if nxt == "\\":                       # 已经是一对合法转义，整体带走
-            out.append("\\\\")
-            index += 2
-        elif nxt == "" or nxt in _VALID_JSON_ESCAPES:
-            out.append(ch + nxt)              # 合法转义或末尾孤立反斜杠：原样
-            index += 2 if nxt else 1
-        else:                                 # 非法：单反斜杠 → 双反斜杠
-            out.append("\\\\" + nxt)
-            index += 2
+        end = index + 1
+        while end < size:
+            if text[end] == "\\":
+                end += 2
+                continue
+            if text[end] == '"':
+                break
+            end += 1
+        out.append('"')
+        out.append(_fix_json_string(text[index + 1:end]))
+        if end >= size:
+            break
+        out.append('"')
+        index = end + 1
     return "".join(out)
+
+
+def _escape_variants(frag: str) -> list[str]:
+    """反斜杠修复的候选，按尝试顺序返回。
+
+    盘符路径要排在**原文前面**：``{"path":"C:\\bob\\file"}`` 本来就是合法 JSON，
+    原文先过就会把 ``\\b``/``\\f`` 解释成退格/换页，路径字母被吃掉 ——
+    真机事故：Read 报「文件不存在」，模型转而声称「调用名被系统篡改」并凭记忆编完答案。
+    其余情况仍原文优先：合法 JSON 里的 ``\\n``/``\\t`` 多半真是换行/制表符。
+    """
+    fixed = _fix_invalid_escapes(frag)
+    if fixed == frag:
+        return [frag]
+    if _DRIVE_PATH.search(frag):
+        return [fixed, frag]
+    return [frag, fixed]
 
 
 def _normalize_fullwidth_quotes(text: str) -> str:
@@ -1590,10 +1664,10 @@ def _json_candidates(text: str, start: int):
     结尾的引号误当成被转义，误判成「切点落在字符串内部」而拒绝补齐。
     """
     head, frag = text[:start], text[start:]
-    variants = [frag]
-    for extra in (_fix_invalid_escapes(frag), _normalize_fullwidth_quotes(frag)):
-        if extra != frag:
-            variants.append(extra)
+    variants = _escape_variants(frag)
+    fullwidth = _normalize_fullwidth_quotes(frag)
+    if fullwidth not in variants:
+        variants.append(fullwidth)
     seen = set()
     for base in variants:
         for candidate in (base, base + _missing_closers(base, 0)):
@@ -1770,6 +1844,7 @@ def _loads_tolerant_obj(text: str):
 
     **原文要先试**：本来就是合法 JSON 时，下面的单引号规则会把双引号字符串内部的
     ``'---'``（shell 命令里到处都是）换成裸双引号，把合法 JSON 改坏 → 整条调用静默丢失。
+    唯一的例外是原文里有单反斜杠的盘符路径 —— 见 ``_escape_variants``。
 
     规范化之后再补一级抢救：修单反斜杠（``C:\\Users``）、全角引号（``{“city”:“北京”}``）。
     **顺序很关键**：这两级只在「规范化结果直接解析失败」之后才试 ——
@@ -1778,7 +1853,12 @@ def _loads_tolerant_obj(text: str):
     body = re.sub(r"([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)", r'\1"\2"\3', text)
     body = re.sub(r"'((?:[^'\\]|\\.)*)'", lambda m: json.dumps(m.group(1).replace("\\'", "'")), body)
     body = re.sub(r",(\s*[}\]])", r"\1", body)
-    for candidate in (text, body, _fix_invalid_escapes(body), _normalize_fullwidth_quotes(body)):
+    candidates: list[str] = []
+    for candidate in (*_escape_variants(text), *_escape_variants(body),
+                      _normalize_fullwidth_quotes(body)):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
         try:
             obj = json.loads(candidate)
         except json.JSONDecodeError:
@@ -1981,25 +2061,70 @@ def _tool_suffix_map(allowed_names: set[str]) -> dict[str, str]:
     return mapping
 
 
+def _mangled_name_candidates(name: str) -> list[str]:
+    """上游吞掉调用后留在「工具名」里的碎片，逐个可能的写法摊平出来。
+
+    名字常常对不上：上游会把没吃干净的语法碎片留在名字里（实测三种形态）：
+
+      * ``tool_call] mcp__CherryHub__invoke`` —— 前缀被它自己的调用语法吞掉，剩下半截；
+      * ``Bash({"command": "ls -la /e/github/be-xigua/"})</arg_value>`` —— 整条调用连参数
+        一起塞进名字，真正的工具名只占开头几个字符；
+      * ``Read`` 前后带 ``<function>``/``<parameter>`` 标签残片。
+    """
+    head = re.split(r"<", name, 1)[0]
+    head = head.split("]")[-1].strip()
+    out = [head]
+    lead = re.match(r"[A-Za-z_][\w.\-]*", head)
+    if lead:
+        out.append(lead.group(0))
+    out.append(head.rsplit("__", 1)[-1].rsplit(".", 1)[-1])
+    return [c for c in dict.fromkeys(out) if c]
+
+
+def _client_tool_for_name(name: str, suffix_to_tool: dict[str, str]) -> str | None:
+    for candidate in _mangled_name_candidates(name):
+        tool = suffix_to_tool.get(candidate.lower())
+        if tool:
+            return tool
+    return None
+
+
+# 上游自己的调用语法残片 —— 名字长成这样，就是「它吃掉了一次调用」的铁证
+INVOKE_RESIDUE = re.compile(
+    r"</?arg_value>|</?function>|<parameter|tool_[0-9a-f]{6,}|\(\s*\{", re.I)
+
+
 def hijacked_client_tools(platform_tools: list[str], allowed_names: set[str]) -> list[str]:
     """上游「自带工具执行记录」里属于客户端 tools 的那几个 —— 即被上游抢跑的工具。
 
-    名字常常对不上：上游会把没吃干净的语法碎片留在名字里（实测回传的是
-    ``tool_call] mcp__CherryHub__invoke`` —— 前缀 ``[tool_`` 被它自己的调用语法吞掉，
-    剩下半截当成工具名）。所以先剥掉方括号碎片，再按「完整名 / 最后一段短名」比对。
+    名字比对见 ``_mangled_name_candidates``。
     """
     if not platform_tools or not allowed_names:
         return []
     suffix_to_tool = _tool_suffix_map(allowed_names)
     hit = set()
     for name in platform_tools:
-        cleaned = name.split("]")[-1].strip()
-        for candidate in (cleaned, cleaned.rsplit("__", 1)[-1].rsplit(".", 1)[-1]):
-            tool = suffix_to_tool.get(candidate.lower())
-            if tool:
-                hit.add(tool)
-                break
+        tool = _client_tool_for_name(name, suffix_to_tool)
+        if tool:
+            hit.add(tool)
     return sorted(hit)
+
+
+def unattributed_hijacks(platform_tools: list[str], allowed_names: set[str]) -> list[str]:
+    """认不出是哪个客户端工具、但确定是调用被上游吃了的那几个名字。
+
+    真机事故（22:05:58）：上游回传的名字是 ``tool_9a822147</arg_value>`` 这类它自己编的
+    散列 —— 不在客户端 tools 里，于是 ``hijacked_client_tools`` 返回空，这一轮被当成
+    「模型选择直接回答」原样返回客户端：模型那三次 Read 从未执行，答案全靠它编。
+    碎片形态说明它确实发起过调用，所以照样得续问。
+
+    ``finish`` / ``search`` / ``execute_sandbox_code`` 这些平台工具名不含碎片，不会被误报。
+    """
+    if not platform_tools or not allowed_names:
+        return []
+    suffix_to_tool = _tool_suffix_map(allowed_names)
+    return [name for name in platform_tools
+            if INVOKE_RESIDUE.search(name) and not _client_tool_for_name(name, suffix_to_tool)]
 
 
 def parse_textual_tool_calls(text: str, allowed_names: set[str]) -> list[dict] | None:
@@ -2643,18 +2768,22 @@ class Handler(BaseHTTPRequestHandler):
             #      function-call 层拦下执行（实测 mcp__CherryHub__exec / invoke）。
             #      客户端的工具压根没跑，模型收到的是上游沙箱里的失败结果，
             #      于是得出「搜索接口异常」的结论并给一个残缺回答。
+            #      名字被上游吞成散列的（blind）也算，见 unattributed_hijacks。
             #   ② 思考泄漏 —— 输出像是泄漏的思考，把碎碎念当答案返回了。
             # 注意 ② 要同时喂正文和思维链：形态 B 下正文为空、碎碎念只在思维链里。
             reason = acc.full_reasoning()
             hijacked = hijacked_client_tools(acc.platform_tools, allowed)
+            blind = unattributed_hijacks(acc.platform_tools, allowed)
             if not calls and attempt < tries and (
-                    hijacked or looks_like_think_leak(text, reason)):
+                    hijacked or blind or looks_like_think_leak(text, reason)):
                 attempt += 1
                 leaked = (text or reason).strip()
-                if hijacked:
+                if hijacked or blind:
                     detail = (f"；上游拿到的结果：{acc.platform_results[-1][:120]!r}"
                               if acc.platform_results else "")
-                    log(f"[tools] 上游抢跑：客户端工具 {hijacked} 被上游自己执行了，"
+                    named = (f"客户端工具 {hijacked}" if hijacked
+                             else f"一次调用（上游把工具名吞成了 {blind}）")
+                    log(f"[tools] 上游抢跑：{named} 被上游自己执行了，"
                         f"客户端从未收到这次调用（第 {attempt}/{tries} 次续问）{detail}")
                 elif leaked:
                     log(f"[tools] 输出疑似泄漏的思考（无回答、无调用），自动续问"
@@ -2677,7 +2806,8 @@ class Handler(BaseHTTPRequestHandler):
                     release_lease()
                 new_resp, new_lease = self._continue_after_think_leak(
                     messages, leaked, model, networking, tools_instructions,
-                    assistant_id, account, deep_thinking, hijacked=hijacked)
+                    assistant_id, account, deep_thinking, hijacked=hijacked,
+                    blind_hijack=bool(blind))
                 if new_resp is None:
                     break   # 续问失败：把这一轮原样返回，好过丢掉已有内容
                 resp, extra_lease = new_resp, new_lease
@@ -2693,10 +2823,12 @@ class Handler(BaseHTTPRequestHandler):
                         log("[tools] 续问后模型仍无任何输出，返回明确提示")
                     text = THINK_LEAK_FALLBACK
                 else:
-                    if hijacked:
+                    if hijacked or blind:
                         # 抢跑且续问次数用尽：这不是「模型选择直接回答」，
                         # 而是客户端工具根本没执行、答案建立在上游沙箱的失败结果上。
-                        log(f"[tools] 上游抢跑且续问已用尽：客户端工具 {hijacked} 未执行，"
+                        named = (f"客户端工具 {hijacked}" if hijacked
+                                 else f"调用（工具名被上游吞成了 {blind}）")
+                        log(f"[tools] 上游抢跑且续问已用尽：{named} 未执行，"
                             f"本轮答案可能缺少实时数据。正文{len(text)}字。")
                         self._diagnose_tool_miss(text, reason, allowed)
                     else:
@@ -2753,17 +2885,20 @@ class Handler(BaseHTTPRequestHandler):
                                    networking: bool, tools_instructions: str,
                                    assistant_id: str, account: "Account" = None,
                                    deep_thinking: bool = False,
-                                   hijacked: list[str] | None = None):
+                                   hijacked: list[str] | None = None,
+                                   blind_hijack: bool = False):
         """续问：把上一轮的问题输出当成 assistant 说过的话，再要求它给出可用结果。
 
         ``hijacked`` 非空时是「上游抢跑」场景 —— 该回客户端的工具被上游自己执行了，
         光要求「给结论」没用（它已经在上游沙箱里试过并失败了），必须要求它
         **改用文字形态重新发起调用**，把调用交回客户端执行。
+        只有 ``blind_hijack`` 时上游连工具名都没回传（见 unattributed_hijacks），
+        只能笼统要求它把上一条打算做的调用重来一遍。
 
         返回 ``(resp, lease)``；失败返回 ``(None, None)``（调用方会把上一轮原样返回）。
         租约交给调用方释放，与主请求同一套生命周期，不会把账号永久占住。
         """
-        if hijacked:
+        if hijacked or blind_hijack:
             nudge = (
                 "你刚才那几个工具调用被网页端自己执行了，而它们是本地客户端注册的工具，"
                 "必须由客户端执行才能拿到真实数据。现在请重新发起这些调用，并且"
@@ -2772,8 +2907,10 @@ class Handler(BaseHTTPRequestHandler):
                 "行首直接是工具名，前面不要加方括号标记或任何前缀词；"
                 "不要输出 JSON 对象（{" + '"tool_calls"' + ": ...} 那种），"
                 "不要使用网页端自带的搜索/浏览工具，也不要只描述你打算做什么。"
-                f"\n需要重新调用的工具：{', '.join(hijacked)}"
             )
+            nudge += (f"\n需要重新调用的工具：{', '.join(hijacked)}" if hijacked else
+                      "\n上一条里被你发出的那几个调用，客户端一个都没收到 —— "
+                      "请照着你的计划把它们逐个重新发起（参数也一样），不要少一个。")
             if leaked:
                 nudge += f"\n\n你上一条的内容是：{leaked}"
         elif leaked:
