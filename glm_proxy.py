@@ -374,12 +374,22 @@ class Account:
         self._expires_at = 0.0
         self._slot = threading.Semaphore(1)
         self._cooldown_until = 0.0
+        # 只给日志用（谁占着这个账号、占了多久、排第几），不参与互斥——
+        # 真正的互斥仍是 _slot 那个大小为 1 的信号量。
+        self.busy = False
+        self.holder = ""
+        self.held_since = 0.0
 
     # ── 串行闸 ──
-    def try_acquire(self) -> bool:
-        return self._slot.acquire(blocking=False)
+    def try_acquire(self, desc: str = "") -> bool:
+        acquired = self._slot.acquire(blocking=False)
+        if acquired:
+            self.busy, self.holder = True, desc
+            self.held_since = time.time()
+        return acquired
 
     def release(self) -> None:
+        self.busy, self.holder = False, ""
         try:
             self._slot.release()
         except ValueError:  # 重复释放不该崩服务
@@ -494,6 +504,7 @@ class AccountPool:
         self._accounts = list(accounts)
         self._lock = threading.Lock()
         self._cursor = 0
+        self._waiting: list[object] = []     # 排队票据，保证账号槽位先到先得
         self._guest: Account | None = None
 
     @property
@@ -524,24 +535,49 @@ class AccountPool:
             start = self._cursor
         return accounts[start:] + accounts[:start]
 
-    def acquire(self) -> Lease:
+    def acquire(self, desc: str = "") -> Lease:
+        """取一个账号槽位；全忙则按**到达顺序**排队（带超时）。
+
+        排队必须先到先得：原来的轮询抢槽不分先后，后到的请求能插到主请求前面
+        （真机：一条侧请求先拿到槽，把主请求压住 4.4s）。另外排队日志必须说清
+        「谁占着账号、占了多久、我在第几位」，否则光有等待时长根本没法归因。
+        """
         deadline = time.time() + self.config.queue_timeout
+        ticket = object()
+        with self._lock:
+            self._waiting.append(ticket)
         queued_at = None
-        while True:
-            for account in self._rotated(self.candidates()):
-                if account.try_acquire():
-                    if queued_at is not None:
-                        log(f"[queue] 排队 {time.time() - queued_at:.1f}s 后获得账号槽位：{account.name}")
-                    return Lease(account)
-            if time.time() >= deadline:
-                raise QueueTimeout(
-                    f"等待 {self.config.queue_timeout:.0f}s 仍无空闲账号（可能都卡在上游生成中）"
-                )
-            if queued_at is None:
-                queued_at = time.time()
-                names = ", ".join(a.name for a in self.candidates()) or "无"
-                log(f"[queue] 账号均忙，请求进入本地队列（持有者：{names}）")
-            time.sleep(0.2)
+        try:
+            while True:
+                with self._lock:
+                    ahead = self._waiting.index(ticket)      # 前面还排着几个人
+                live = self.candidates()
+                # 有几个空闲账号，就放队首几个人去抢（多账号时不至于被排队串行化）
+                if ahead < max(1, sum(1 for a in live if not a.busy)):
+                    for account in self._rotated(live):
+                        if account.try_acquire(desc):
+                            if queued_at is not None:
+                                log(f"[queue] 排队 {time.time() - queued_at:.1f}s"
+                                    f"（前面 {ahead} 人）后获得账号槽位：{account.name}")
+                            return Lease(account)
+                if time.time() >= deadline:
+                    raise QueueTimeout(
+                        f"等待 {self.config.queue_timeout:.0f}s 仍无空闲账号（可能都卡在上游生成中）"
+                    )
+                if queued_at is None:
+                    queued_at = time.time()
+                    holders = "、".join(
+                        f"{a.name} 已持有 {time.time() - a.held_since:.1f}s"
+                        f"（{a.holder or '未知请求'}）"
+                        for a in live if a.busy) or "无"
+                    log(f"[queue] 账号均忙，请求进入本地队列"
+                        f"（第 {ahead + 1} 位，排队上限 {self.config.queue_timeout:.0f}s；"
+                        f"持有者：{holders}）")
+                time.sleep(0.2)
+        finally:
+            with self._lock:
+                if ticket in self._waiting:
+                    self._waiting.remove(ticket)
 
 
 # ─────────────────────────── 消息转换 ──────────────────────────
@@ -1241,32 +1277,111 @@ def _render_example_block(tools: list[dict]) -> str:
     )
 
 
+# 定义行压缩。整段 json.dumps(schema) 的体积九成是属性长篇说明：真机 Qoder 的 Bash
+# 一行就 >10K 字，20000 的预算反而把它挤出局 —— 每轮都要用的工具没参数，
+# 提示词还写着「猜了必失败」。压成「属性:类型（必填）｜一句说明」后信息密度高得多。
+TOOL_DEF_DESC_MAX_CHARS = 140         # 工具描述（取首句后）上限
+TOOL_DEF_PARAM_DESC_MAX_CHARS = 60    # 单个参数说明上限
+TOOL_DEF_TYPE_MAX_DEPTH = 2           # 嵌套类型只展开两层，更深写成 object
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _compact_type(node: dict, depth: int = 0) -> str:
+    """JSON Schema 节点 → 短标记：``string``、``array<{k:v}>``、``string[a|b]``、``a|b``。"""
+    if not isinstance(node, dict):
+        return "any"
+    alts = node.get("anyOf") or node.get("oneOf")
+    if alts:
+        joined = "|".join(_compact_type(item, depth + 1)
+                          for item in alts if isinstance(item, dict))
+        return joined or "any"
+    kind = node.get("type", "any")
+    enum = node.get("enum")
+    if isinstance(enum, list) and enum:
+        shown = "|".join(str(v) for v in enum[:6])
+        return f"{kind}[{shown}{'|…' if len(enum) > 6 else ''}]"
+    if kind == "array":
+        return f"array<{_compact_type(node.get('items') or {}, depth + 1)}>"
+    if kind == "object" and depth < TOOL_DEF_TYPE_MAX_DEPTH:
+        props = {k: v for k, v in (node.get("properties") or {}).items()
+                 if isinstance(v, dict)}
+        if props:
+            required = set(node.get("required") or [])
+            inner = "，".join(f"{key}:{_compact_type(value, depth + 1)}"
+                              f"{'*' if key in required else ''}"
+                              for key, value in props.items())
+            return f"{{{inner}}}"
+    # format 是少数几个「删了就必然出错」的 schema 字段：真机 qoder-sites 的 siteId/
+    # deploymentId 全是 string+uuid，只写 string 时模型会编一个 "abc" 上去，上游 400 之后
+    # 这轮工具等于白跑。pattern/default 之类太占地、且猜错只是语义不对，故不带。
+    fmt = node.get("format")
+    if isinstance(fmt, str) and fmt:
+        return f"{kind}:{fmt}"
+    return kind
+
+
+def _compact_params(params: dict) -> str:
+    """顶层参数逐个压成 ``名字:类型（必填）｜首句说明``。"""
+    props = {k: v for k, v in (params.get("properties") or {}).items()
+             if isinstance(v, dict)}
+    if not props:
+        return ""
+    required = set(params.get("required") or [])
+    parts = []
+    for key, node in props.items():
+        piece = f"{key}:{_compact_type(node)}"
+        if key in required:
+            piece += "（必填）"
+        lines = str(node.get("description") or "").strip().splitlines()
+        if lines:
+            piece += f"｜{_clip(lines[0], TOOL_DEF_PARAM_DESC_MAX_CHARS)}"
+        parts.append(piece)
+    return "，".join(parts)
+
+
 def render_tools_prompt(tools: list[dict], max_chars: int = TOOLS_PROMPT_MAX_CHARS) -> str:
     """把 OpenAI 的 tools 定义渲染成提示词（替代原生 function calling）。
 
-    ``max_chars`` 只约束**定义行**，协议说明永远全文保留：真机几十个 MCP Schema 全量塞入
-    会把协议本身埋掉，模型于是无视格式、编造工具名。``<=0`` 表示不裁剪。
-    第一个放不下的工具**及其后所有工具**都只列名字（保持列表顺序可预期）。
+    定义行是**压缩渲染**（描述取首句、参数写成 ``名:类型（必填）｜短说明``），
+    体积仍超 ``max_chars`` 时才降级为「只列名字」；``max_chars <= 0`` 表示不裁剪。
+    协议说明永远全文保留：真机几十个 MCP Schema 全量塞入会把协议本身埋掉，
+    模型于是无视格式、编造工具名。
+
+    裁剪时的挑选顺序是「客户端自带工具优先，其次按体积从小到大」：
+    纯按客户端顺序贪心时，字母序最前的两个多KB schema 能吃满预算，让
+    Bash/Read/Edit 这些每轮都要用的工具全部只剩名字；纯按体积贪心则会先塞进
+    几十个根本用不到的 MCP 小工具（实测展开 34 个，其中 25 个是 qoder-sites，
+    而 Bash、Edit、Read 依旧被降级）。自带工具优先才是有用的取舍。
+    入选行仍按原始顺序输出（列表顺序可预期，不受挑选影响）。
     注意：裁剪只影响提示词，不影响能否解析 —— 调用名集合始终来自完整工具列表。
     """
-    lines: list[str] = []
-    skipped: list[str] = []
-    used = 0
-    stopped = False
-    for tool in tools:
-        line = f"- {tool['name']}：{tool['description'] or '（无描述）'}"
-        params = tool.get("parameters") or {}
-        if params:
-            line += f"\n  参数 JSON Schema：{json.dumps(params, ensure_ascii=False)}"
-        if stopped or (max_chars > 0 and used + len(line) > max_chars):
-            stopped = True
-            skipped.append(tool["name"])
-            continue
-        used += len(line)
-        lines.append(line)
+    def definition(tool: dict) -> tuple[str, str]:
+        desc = (tool["description"] or "").strip() or "（无描述）"
+        line = f"- {tool['name']}：{_clip(desc.splitlines()[0], TOOL_DEF_DESC_MAX_CHARS)}"
+        compact = _compact_params(tool.get("parameters") or {})
+        if compact:
+            line += f"\n  参数：{compact}"
+        return line, tool["name"]
+
+    defs = [definition(tool) for tool in tools]
+    if max_chars > 0:
+        used, expanded = 0, set()
+        # 自带工具（非 mcp__ 前缀）先挑，同档内小的先挑
+        for line, name in sorted(defs, key=lambda item: (item[1].startswith("mcp__"),
+                                                          len(item[0]))):
+            if used + len(line) <= max_chars:
+                used += len(line)
+                expanded.add(name)
+        lines = [line for line, name in defs if name in expanded]
+        skipped = [name for line, name in defs if name not in expanded]
+    else:
+        lines, skipped = [line for line, _ in defs], []
 
     if skipped:
-        log(f"[tools] 工具定义超预算已裁剪：{len(tools) - len(skipped)} 个完整展开、"
+        log(f"[tools] 工具定义超预算已裁剪：{len(lines)} 个完整展开、"
             f"{len(skipped)} 个仅列名字（{'、'.join(skipped[:5])}"
             f"{'…' if len(skipped) > 5 else ''}）")
         # 标题把「哪些工具参数没展开」说在前面，否则模型会以为列表里每个工具都能直接调
@@ -1653,6 +1768,9 @@ def _find_closing(text: str, start: int) -> int:
 def _loads_tolerant_obj(text: str):
     """把 JS 风格对象字面量转成 dict（键可无引号、可单引号、可尾逗号）。失败返回 None。
 
+    **原文要先试**：本来就是合法 JSON 时，下面的单引号规则会把双引号字符串内部的
+    ``'---'``（shell 命令里到处都是）换成裸双引号，把合法 JSON 改坏 → 整条调用静默丢失。
+
     规范化之后再补一级抢救：修单反斜杠（``C:\\Users``）、全角引号（``{“city”:“北京”}``）。
     **顺序很关键**：这两级只在「规范化结果直接解析失败」之后才试 ——
     上面的单引号规则本来就会把路径里的反斜杠正确地重新转义，先修再转会把反斜杠加倍。
@@ -1660,7 +1778,7 @@ def _loads_tolerant_obj(text: str):
     body = re.sub(r"([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)", r'\1"\2"\3', text)
     body = re.sub(r"'((?:[^'\\]|\\.)*)'", lambda m: json.dumps(m.group(1).replace("\\'", "'")), body)
     body = re.sub(r",(\s*[}\]])", r"\1", body)
-    for candidate in (body, _fix_invalid_escapes(body), _normalize_fullwidth_quotes(body)):
+    for candidate in (text, body, _fix_invalid_escapes(body), _normalize_fullwidth_quotes(body)):
         try:
             obj = json.loads(candidate)
         except json.JSONDecodeError:
@@ -1923,7 +2041,13 @@ def parse_textual_tool_calls(text: str, allowed_names: set[str]) -> list[dict] |
         })
     # 不在这里提前 break：上游常把同一个块输出两遍，截断版会白占一个额度。
     # 先收全、去重，再限数。
-    return _dedupe_calls(calls)[:TEXTUAL_CALL_MAX] or None
+    deduped = _dedupe_calls(calls)
+    if len(deduped) > TEXTUAL_CALL_MAX:
+        # 静默截断过一次就会让客户端少跑一个工具，而日志上看不出任何异常（真机：12→5 后丢第 5 个）
+        dropped = [c["function"]["name"] for c in deduped[TEXTUAL_CALL_MAX:]]
+        log(f"[tools] 文字风格调用超出单轮上限 {TEXTUAL_CALL_MAX}，"
+            f"本轮丢弃 {len(dropped)} 个：{dropped}（下一轮模型会重新请求）")
+    return deduped[:TEXTUAL_CALL_MAX] or None
 
 
 class GLMClient:
@@ -1952,9 +2076,13 @@ class GLMClient:
                                deep_thinking)
         total = self.config.busy_retries
         last_error: Exception | None = None
+        # 排队日志要能认出「是谁占住了账号」——只报等待时长没法归因（真机：主请求被压 4.4s）
+        holder_desc = (f"{model} msgs={len(messages)} "
+                       f"tools={'有' if tools_instructions else '无'} "
+                       f"thinking={'开' if deep_thinking else '关'}")
 
         for attempt in range(total + 1):
-            lease = self.pool.acquire()
+            lease = self.pool.acquire(holder_desc)
             account = lease.account
             try:
                 resp = self._request(body, account)
@@ -2121,6 +2249,9 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "glm-proxy/0.2"
 
+    # 类属性：跨请求去重，每个未映射的模型名只提示一次
+    warned_unmapped_models: set[str] = set()
+
     # 由 main() 注入
     config: Config = None
     client: GLMClient = None
@@ -2241,13 +2372,21 @@ class Handler(BaseHTTPRequestHandler):
             log("[compat] 请求带 tools，但没有解析出可用的 function 定义（缺 name？），已忽略")
         if self.config.verbose:
             log(f"[req] model={model} stream={want_stream} msgs={len(messages)} "
-                f"tools={len(tool_defs)} networking={networking} prompt={len(tools_instructions)}B "
+                f"tools={len(tool_defs)} networking={networking} "
+                f"prompt={len(tools_instructions)}字 "
                 f"deep_thinking={deep_thinking}")
 
         # 模型名 → 上游 assistant_id 映射（GLM_MODEL_ASSISTANT_MAP）
         assistant_id = self.config.model_assistant_map.get(model.lower(), "")
         if assistant_id and self.config.verbose:
             log(f"[model] {model} → assistant_id={assistant_id}（来自 GLM_MODEL_ASSISTANT_MAP）")
+        elif not assistant_id and model.lower() not in self.warned_unmapped_models:
+            # 没映射时「换模型名」是静默 no-op：客户端以为切了 glm-4.6，实际还是同一个 assistant。
+            # 每个模型名只提醒一次，多了只会淹掉真问题。
+            self.warned_unmapped_models.add(model.lower())
+            log(f"[model] {model} 未配置 assistant_id 映射，本次仍走默认 assistant_id"
+                f"（{self.config.assistant_id or '访客'}）——客户端选的模型名不会生效；"
+                f"上游实际模型见 [upstream] 行，要真切换请配 GLM_MODEL_ASSISTANT_MAP")
 
         # 排队 + 撞闸退避重试都在 open_stream 内部完成，这里只负责把异常映射成 HTTP 状态码
         try:

@@ -30,7 +30,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -445,6 +445,30 @@ class PureLogicTest(unittest.TestCase):
         self.assertEqual(names, ["mcp__CherryHub__list", "mcp__CherryHub__invoke"])
         # 前缀是普通标识符字符（foo_invoke）→ 不是完整工具名，拒绝，避免误伤
         self.assertIsNone(gp.parse_textual_tool_calls("foo_invoke({ a: 1 })", allowed))
+
+    def test_loads_tolerant_obj_keeps_valid_json_with_inner_single_quotes(self):
+        """参数里带 shell 单引号时不能把合法 JSON 改坏。
+
+        旧实现先跑单引号→双引号规范化，再解析：``"… && echo '---' && …"`` 里的单引号
+        被换成裸双引号，合法 JSON 变成非法，整条 Bash 调用静默丢弃（真机日志里
+        客户端因此收到原始文本而不是 tool_calls）。
+        """
+        raw = '{"command": "find pages assets -type f && echo \'---\' && wc -l x/* 2>/dev/null"}'
+        self.assertEqual(gp._loads_tolerant_obj(raw), json.loads(raw))
+        # 抢救顺序不变：单反斜杠路径、全角引号仍要能救回来
+        self.assertEqual(gp._loads_tolerant_obj('{"path": "C:\\Users\\silzh"}'),
+                         {"path": "C:\\Users\\silzh"})
+        self.assertEqual(gp._loads_tolerant_obj('{“city”:“北京”}'), {"city": "北京"})
+        # 规范化后仍解析不了 → None（不返回半截参数）
+        self.assertIsNone(gp._loads_tolerant_obj('{"command": "unterminated '))
+
+    def test_parse_textual_tool_calls_handles_shell_single_quotes(self):
+        allowed = {"Bash", "Read"}
+        calls = gp.parse_textual_tool_calls(
+            'Bash({"command": "grep \'TODO\' src/app.py && echo \'---\' && ls"})', allowed)
+        self.assertIsNotNone(calls)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"command": "grep 'TODO' src/app.py && echo '---' && ls"})
 
     def test_config_models_list(self):
         with env_patch({}):
@@ -977,6 +1001,53 @@ class ConcurrencyTest(FakeUpstreamCase):
         finally:
             accounts[0].release()
 
+    def test_queue_grants_in_arrival_order(self):
+        """先到先得：后到的请求不能插到已排队请求前面（真机被侧请求插队压住 4.4s）。"""
+        config, accounts, pool, client = self.build_client(["seed-1"], queue_timeout=20)
+        self.assertTrue(accounts[0].try_acquire("占位请求"))
+        order: list[str] = []
+
+        def worker(tag: str) -> None:
+            lease = pool.acquire(tag)
+            order.append(tag)
+            time.sleep(0.05)
+            lease.release()
+
+        threads = []
+        try:
+            for tag in ("A", "B", "C"):
+                thread = threading.Thread(target=worker, args=(tag,))
+                thread.start()
+                threads.append(thread)
+                time.sleep(0.05)          # 确保入队次序就是 A→B→C
+            accounts[0].release()         # 放行
+            for thread in threads:
+                thread.join(timeout=20)
+        finally:
+            accounts[0].release()
+        self.assertEqual(order, ["A", "B", "C"])
+
+    def test_queue_log_explains_who_holds_the_slot(self):
+        """排队日志要能归因：谁占着账号、占了多久、自己排第几 —— 只有等待时长没用。"""
+        config, accounts, pool, client = self.build_client(["seed-1"], queue_timeout=0.4)
+        self.assertTrue(accounts[0].try_acquire("glm-5.3 msgs=2 tools=无 thinking=开"))
+        buf = io.StringIO()
+
+        def waiter() -> None:
+            with redirect_stdout(buf):
+                try:
+                    pool.acquire("glm-5.3 msgs=9 tools=有 thinking=开").release()
+                except gp.QueueTimeout:
+                    pass
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        thread.join(timeout=10)
+        accounts[0].release()
+        out = buf.getvalue()
+        self.assertIn("glm-5.3 msgs=2 tools=无 thinking=开", out)   # 持有者是谁
+        self.assertIn("第 1 位", out)                                # 我在第几位
+
     def test_busy_gate_is_retried_then_succeeds(self):
         config, _, _, client = self.build_client(["seed-1"], busy_retries=3)
         self.fake.script = [("busy", BUSY_PAYLOAD), ("busy", BUSY_PAYLOAD), ("sse", SSE_TEXT)]
@@ -1385,7 +1456,7 @@ class HttpEndToEndTest(FakeUpstreamCase):
         self.assertEqual(choice["message"]["tool_calls"][0]["function"]["name"], "tool_39")
         prompt = json.loads(self.fake.bodies[-1])["messages"][0]["content"][0]["text"]
         self.assertIn("未展开的工具（参数请勿猜测，猜了必失败）：", prompt)
-        self.assertLess(prompt.count("参数 JSON Schema"), 40)
+        self.assertLess(prompt.count("\n  参数："), 40)
 
     def test_tool_mode_stream_returns_tool_calls(self):
         self.config.prompt_tool_calling = True
@@ -1609,6 +1680,23 @@ class HttpEndToEndTest(FakeUpstreamCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(self.fake.bodies[-1])["assistant_id"],
                          gp.DEFAULT_ASSISTANT_ID)
+
+    def test_unmapped_model_name_is_called_out_once(self):
+        """没配映射时「换模型名」是静默 no-op，必须在日志里说破；但每个名字只说一次。"""
+        gp.Handler.warned_unmapped_models.clear()
+        self.config.model_assistant_map = {"glm-5.3": "aaaaaaaabbbbbbbbcccccccc"}
+        buf = io.StringIO()
+        for _ in range(2):
+            with redirect_stdout(buf):
+                status, _ = self.post_json({"model": "glm-4", "messages": [BUSY_REQUEST]})
+            self.assertEqual(status, 200)
+        out = buf.getvalue()
+        self.assertIn("glm-4 未配置 assistant_id 映射", out)
+        self.assertEqual(out.count("未配置 assistant_id 映射"), 1)
+        # 配了映射的名字不该被误报
+        with redirect_stdout(buf):
+            self.post_json({"model": "glm-5.3", "messages": [BUSY_REQUEST]})
+        self.assertNotIn("glm-5.3 未配置", buf.getvalue())
 
     def test_networking_flag_is_forwarded(self):
         status, _ = self.post_json(
@@ -2903,31 +2991,96 @@ class ToolsPromptBudgetTest(unittest.TestCase):
 
     @staticmethod
     def fat_tools(count: int = 20) -> list[dict]:
+        """真机形状：工具描述和参数说明都长篇大论（Qoder 的 Bash 一整行 >10K 字）。"""
         return gp.extract_tool_definitions({"tools": [
             {"type": "function", "function": {
-                "name": f"tool_{i}", "description": f"第 {i} 个工具",
+                "name": f"tool_{i}", "description": f"第 {i} 个工具。" + "用途说明。" * 200,
                 "parameters": {"type": "object", "properties": {
                     "query": {"type": "string", "description": "关键词" * 300},
                     "mode": {"type": "string", "enum": [f"v{j}" for j in range(120)]}},
                 "required": ["query"]}}}
             for i in range(count)]})
 
+    def test_definitions_are_compacted_not_dumped(self):
+        """定义行压缩渲染：长说明截首句，参数写成「名:类型（必填）｜短说明」。
+
+        全量 json.dumps(schema) 时 Bash 一行就 >10K 字，预算 20000 反而把它挤出局 ——
+        每轮都要用的工具没参数，提示词还写着「猜了必失败」。
+        """
+        prompt = gp.render_tools_prompt(self.fat_tools(1), max_chars=0)
+        line = next(item for item in prompt.splitlines() if item.startswith("- tool_0："))
+        self.assertLessEqual(len(line), gp.TOOL_DEF_DESC_MAX_CHARS + len("- tool_0："))
+        self.assertIn("第 0 个工具。", line)       # 首句留着
+        self.assertTrue(line.endswith("…"))        # 超长部分被裁掉，不是整行照抄
+        self.assertNotIn("关键词" * 20, prompt)
+        self.assertIn("query:string（必填）", prompt)         # 参数名/类型/必填留着
+        self.assertIn("mode:string[v0|v1|v2|v3|v4|v5|…]", prompt)  # 枚举给前几个
+        self.assertGreater(prompt.index("- tool_0："), prompt.index("可用工具："))
+
+    def test_format_survives_compaction(self):
+        """format 是「删了就必然出错」的字段：真机 siteId 只写 string 时模型会编一个 "abc"。"""
+        tools = gp.extract_tool_definitions({"tools": [{
+            "type": "function", "function": {
+                "name": "get_site", "description": "读站点",
+                "parameters": {"type": "object",
+                               "properties": {
+                                   "siteId": {"type": "string", "format": "uuid"},
+                                   "tableName": {"type": "string",
+                                                 "pattern": "^[a-z][a-z0-9_]{0,62}$"}},
+                               "required": ["siteId"]}},
+        }]})
+        line = gp._compact_params(tools[0]["parameters"])
+        self.assertIn("siteId:string:uuid（必填）", line)
+        self.assertNotIn("^[a-z]", line)          # pattern 太长，不进提示词
+
     def test_definitions_are_trimmed_but_protocol_is_not(self):
         tools = self.fat_tools()
-        full = gp.render_tools_prompt(tools, max_chars=0)
-        trimmed = gp.render_tools_prompt(tools, max_chars=4000)
-        self.assertLess(len(trimmed), len(full) / 3)
+        trimmed = gp.render_tools_prompt(tools, max_chars=1200)
         # 协议说明永远全文保留（它才是被埋掉的那部分）
         for marker in ("# TOOLS", "行首硬要求", "形状硬要求", "正确示例"):
             self.assertIn(marker, trimmed)
-        self.assertLess(trimmed.count("参数 JSON Schema"), len(tools))
+        self.assertLess(trimmed.count("\n  参数："), len(tools))   # 确有工具被降级
+        self.assertIn("可用工具：", trimmed)
 
     def test_omitted_tools_are_still_listed_by_name(self):
-        trimmed = gp.render_tools_prompt(self.fat_tools(), max_chars=4000)
+        trimmed = gp.render_tools_prompt(self.fat_tools(), max_chars=1200)
         self.assertIn("未展开的工具（参数请勿猜测，猜了必失败）：", trimmed)
         self.assertIn("tool_19", trimmed)              # 名字还在（模型得知道它存在）
         self.assertNotIn("- tool_19：", trimmed)        # 但参数不展开
         self.assertIn("仅列名字", trimmed)
+
+    def test_client_tools_beat_mcp_tools_for_budget(self):
+        """预算不够时先保客户端自带工具：真机按体积挑会先塞进 25 个用不到的 qoder-sites，
+        而 Bash/Edit/Read 依旧只剩名字。"""
+        tools = gp.extract_tool_definitions({"tools": [
+            {"type": "function", "function": {
+                "name": f"mcp__sites__tool_{i}", "description": "站点工具",
+                "parameters": {"type": "object",
+                               "properties": {"id": {"type": "string"}}}}}
+            for i in range(12)
+        ] + [
+            {"type": "function", "function": {     # 自带工具排最后，且描述肥得离谱
+                "name": "Bash", "description": "执行命令",
+                "parameters": {"type": "object", "properties": {
+                    "command": {"type": "string", "description": "要执行的命令" * 300}},
+                    "required": ["command"]}}}
+        ]})
+        trimmed = gp.render_tools_prompt(tools, max_chars=150)
+        self.assertIn("- Bash：", trimmed)
+        self.assertIn("command:string（必填）", trimmed)
+        self.assertIn("未展开的工具（参数请勿猜测，猜了必失败）：mcp__sites__tool_", trimmed)
+        self.assertNotIn("- mcp__sites__tool_11：", trimmed)
+
+    def test_expanded_lines_keep_original_order(self):
+        """挑选按优先级+体积，但输出顺序仍是客户端原始顺序（模型看到的列表顺序可预期）。"""
+        def tool(name: str, filler: int) -> dict:
+            return {"type": "function", "function": {
+                "name": name, "description": "说明" * filler, "parameters": {}}}
+        tools = gp.extract_tool_definitions({"tools": [
+            tool("zed", 500), tool("alpha", 5), tool("mid", 20)]})
+        trimmed = gp.render_tools_prompt(tools, max_chars=80)
+        self.assertNotIn("- zed：", trimmed)             # 最大的那个被让位
+        self.assertLess(trimmed.index("- alpha："), trimmed.index("- mid："))
 
     def test_budget_zero_disables_trimming(self):
         prompt = gp.render_tools_prompt(self.fat_tools(), max_chars=0)
