@@ -2,6 +2,8 @@
 .env
 .glm_tokens.json
 .glm_tokens.json.tmp
+.glm_usage.json
+.glm_usage.json.tmp
 __pycache__/
 *.pyc
 

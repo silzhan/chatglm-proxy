@@ -11,6 +11,8 @@
 - **并发治理**：按账号串行排队 + 撞并发闸指数退避重试（不再把「请等待其他对话生成完毕」甩给客户端）
 - **多账号**：`GLM_REFRESH_TOKENS` 逗号分隔，账号间并行、失效自动轮换、全挂可退回游客
 - **token 自愈**：上游轮换的 `refresh_token` 自动落盘，重启不再用回旧值
+- **用量统计**：`usage` / `count_tokens` 走本地估算（上游不返回计数字段），累计值按天
+  聚合落盘，`GET /v1/usage` 随时查看（详见「四、使用 → token 用量统计」）
 - **工具调用**：默认开启，用提示词 + JSON 解析把客户端 `tools` 模拟成标准 OpenAI `tool_calls`
   （网页版接口无原生 function calling，这是模拟方案，详见「四、使用」）
 - **v0.3 工具链稳定性**：思考泄漏自动续问（3 种形态）+ 工具结果限体积（防上下文撑爆）
@@ -409,7 +411,8 @@ Cline、各类 Anthropic SDK 指向本服务：
 | 路由 | 说明 |
 |---|---|
 | `POST /v1/messages` | 流式 + 非流式；支持 `system`、多模态 `content` 块、`tools`、`stop_sequences`、`thinking` |
-| `POST /v1/messages/count_tokens` | 粗略 token 估算（Claude Code 用它做上下文预算） |
+| `POST /v1/messages/count_tokens` | token 估算（Claude Code 用它做上下文预算） |
+| `GET /v1/usage` | 查看本地累计的用量统计（按天 / 模型 / 账号） |
 
 路径同样兼容客户端对 `/v1` 的拼接差异（`/messages`、`/v1/v1/messages` 等都能用）。
 鉴权复用 `SERVER_API_KEYS`，同时接受 OpenAI 惯用的 `Authorization: Bearer <key>` 与
@@ -452,8 +455,76 @@ Claude Code 等命令行客户端：把 `ANTHROPIC_BASE_URL` 指向本服务（�
 | 工具（`tool_use`/`tool_result`） | 沿用 OpenAI 侧的提示词模拟方案。`tool_use` 的 `input` 由模型输出的 JSON 解析得到，`tool_result` 会被拍平进上游提示词（`Tool(名字): 结果`），多轮工具上下文不丢。带 `tools` 的请求同样会**先缓冲整段**再回流 |
 | thinking | 请求带 `thinking`（且未 `disabled`）时，上游思维链输出成 `thinking` block（流式为 `thinking_delta`）。**上游不提供真正的 signature**，本代理给的是占位值；若客户端严格校验 signature 而报错，设 `ANTHROPIC_EMIT_THINKING=false` 关掉（思维链被丢弃，不会混进正文） |
 | `stop_sequences` | 上游网页版不支持该参数，只能在拿到完整输出后**本地截断**：命中第一个 stop_sequence 即截断该串并返回 `stop_reason="stop_sequence"`。命中 `stop_sequences` 的请求同样会先缓冲 |
-| `max_tokens` | 接受但**不强制**（上游网页版不吃这个参数）；仅 `count_tokens` 与 `usage` 做粗略估算（按字节数估算，非精确 tokenizer） |
+| `max_tokens` | 接受但**不强制**（上游网页版不吃这个参数）；`usage` 与 `count_tokens` 是本地估算值，非精确 tokenizer（见「token 用量统计」） |
 | 错误映射 | Anthropic 错误信封 `{"type":"error","error":{"type":...,"message":...}}`：`401 authentication_error`、`503 overloaded_error`（排队超时/上游繁忙）、`502 api_error`、`400 invalid_request_error` |
+
+### token 用量统计（本地估算）
+
+上游网页版接口的 SSE 事件里**没有任何 token 计数字段**（翻遍 `server.log` 零命中），
+所以 `usage` 和 `count_tokens` 全是本地估算值，不是上游精确计数。已知这个前提后，
+下面这些才对得上号。
+
+**估算口径**（`token_estimate.py`，取向是「宁可高估」）：
+
+| 项 | 口径 |
+|---|---|
+| 中文 | 1 字 ≈ 1 token（GLM tokenizer 实际约 1~1.5 字/token，这里估高） |
+| 英文/数字/符号 | 3.3 字符 ≈ 1 token（实际约 4，这里估高） |
+| 每条 message | 另加 4 token 结构开销（role、分隔符、JSON 括号） |
+| 图片等内容块 | 按块给 1024 占位（没法按字符算） |
+| `tool_calls` 回传 | agent 循环里每轮都会原样带回，按序列化体积计入 |
+| 上游系统提示 | 客户端看不到也估算不到，用 `GLM_SYSTEM_PROMPT_OVERHEAD`（默认 200）补偿 |
+| 整体 | 最后统一 `ceil` 并乘 1.05 |
+
+**为什么偏要高估**：估低了客户端（Claude Code / Cline）就不触发上下文压缩，一路捅到
+上游 context 上限，报出来的是整个会话废掉的错；估高只是早压缩一次，代价小得多。
+
+**出口**：
+
+| 出口 | 行为 |
+|---|---|
+| `usage`（OpenAI 非流式） | `prompt_tokens` / `completion_tokens` / `total_tokens` 全是估算值 |
+| `usage`（OpenAI 流式） | **默认不发**。请求带 `stream_options: {"include_usage": true}` 时，在 `[DONE]` 之前补一个 `choices: []` 的尾帧带上 usage（OpenAI 官方约定位置） |
+| Anthropic `message_start` / `message_delta` | `input_tokens` / `output_tokens`，思维链单独计入 output |
+| `POST /v1/messages/count_tokens` | 与上面同一套函数，客户端拿它做上下文预算 |
+
+**累计统计**（`usage_stats.py`）：单次结果不落盘，只写进响应和一行日志；累计值按
+**天 × 模型 × 账号**三维聚合，节流落盘到 `.glm_usage.json`（默认 60s 一次 + 退出时兜一次，
+`tmp + os.replace` 原子写，保留最近 7 天，当天数据重启后接回）。
+
+```bash
+curl http://127.0.0.1:8000/v1/usage -H "Authorization: Bearer <key>"
+```
+
+```json
+{
+  "enabled": true, "estimated": true, "day": "2026-10-09",
+  "today": {"requests": 12, "input_tokens": 41200, "output_tokens": 9600,
+            "reasoning_tokens": 2100, "tool_calls": 34, "elapsed_ms": 512000,
+            "by_model": {"glm-4": {"requests": 12, "input_tokens": 41200, "...": "..."}},
+            "by_account": {"账号1": {"requests": 12, "input_tokens": 41200, "...": "..."}}},
+  "days": {}
+}
+```
+
+每次请求还会打一行日志，`grep '\[usage\]' server.log` 就是逐条明细：
+
+```
+[22:37:11] [usage] api=openai model=glm-4 account=账号1 in=897 out=42 tools=1 0.0s | 今日 12次 in=20300 out=5100
+```
+
+相关配置：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GLM_SYSTEM_PROMPT_OVERHEAD` | `200` | 上游自注入系统提示的补偿值，调大 = 估得更激进 |
+| `GLM_PERSIST_USAGE` | `true` | 是否把累计值落盘 |
+| `GLM_USAGE_FILE` | `.glm_usage.json` | 落盘路径（与 `.glm_tokens.json` 同目录同待遇） |
+| `GLM_USAGE_FLUSH` | `60` | 落盘间隔（秒）。第一次请求后立即写一次，之后才节流 |
+| `GLM_USAGE_KEEP_DAYS` | `7` | 保留最近几天的归档 |
+
+> 想更准就自己接真 tokenizer（GLM-4 的 `tokenizer.json` + HuggingFace `tokenizers`），
+> 替换 `token_estimate.py` 里的实现即可，函数签名不用动。
 
 ## 五、v0.3 变更说明（工具链稳定性）
 
@@ -590,11 +661,12 @@ python -m unittest discover -s tests -v
 真 HTTP 端到端（路由 / 鉴权 / 路径别名 / 流式增量 / BOM 请求体 / 503 与 502 映射），
 以及 Anthropic `/v1/messages`（非流式/流式事件序列 / system / thinking 开关 / tool_use 与
 tool_result 回传 / 文字风格翻译 / stop_sequences 本地截断 / x-api-key 鉴权 / count_tokens / 路径别名）。
+**token 估算（CJK/英文加权、message 结构开销、tool_calls 回传、图片占位）与用量统计（聚合维度 / 落盘往返 / 节流 / 跳天归档与淘汰 / 损坏文件容错）**。
 
 预期结尾：
 
 ```
-Ran 204 tests in 40s
+Ran 289 tests in 65s
 OK
 ```
 
@@ -626,13 +698,16 @@ OK
 ## 八、文件说明
 
 ```
-glm_proxy.py             主程序（签名 / 账号与串行闸 / token 落盘 / 消息转换 / 工具结果限体积 /
+glm_proxy.py             主程序（签名 / 账号与串行闸 / token 落盘 / 消息转换 / usage 计算与统计 / 工具结果限体积 /
                          思考泄漏检测与续问 / SSE 解析 / UTF-8 日志 / HTTP 服务）
 anthropic_api.py         Anthropic Messages API 适配层（/v1/messages，协议翻译，被 glm_proxy.py 导入）
+token_estimate.py        token 估算（上游不返回计数字段，全站在这里算）
+usage_stats.py           用量累计统计（按天聚合 + 节流落盘）
 start.bat / start.sh     启动脚本（检查 Python、补 .env、前台启动；用 --log-file 写 UTF-8 日志）
-tests/test_glm_proxy.py  离线自测（假上游替身 + 真 HTTP 端到端），136 个用例
+tests/test_glm_proxy.py  离线自测（假上游替身 + 真 HTTP 端到端），289 个用例
 .env.example             配置示例
 .glm_tokens.json         运行后自动生成：上游轮换后的 refresh_token（明文，勿外发）
+.glm_usage.json           运行后自动生成：用量统计（估算值，已在 .gitignore 忽略）
 server.log / server.err  启动脚本产生的运行日志（UTF-8，已在 .gitignore 中忽略）
 ```
 

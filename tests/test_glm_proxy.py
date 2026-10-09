@@ -36,6 +36,8 @@ from http.server import ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import glm_proxy as gp  # noqa: E402
+import token_estimate  # noqa: E402
+import usage_stats  # noqa: E402
 
 SSE_TEXT = (
     'data: {"conversation_id":"conv-1","parts":[{"logic_id":"p1","model":"moe_53f",'
@@ -3293,6 +3295,252 @@ class UpstreamHijackEndToEndTest(FakeUpstreamCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.fake.stream_calls, 1)
         self.assertEqual(data["choices"][0]["finish_reason"], "stop")
+
+
+class TokenEstimateTest(unittest.TestCase):
+    """token 估算：口径、边界、以及「宁可高估」的取向。"""
+
+    def test_cjk_counts_more_than_latin(self):
+        # 中文 1 字 ≈ 1 token；英文 4 字符 ≈ 1 token，同样字符数中文更贵
+        self.assertEqual(token_estimate.estimate_text_tokens("你好世界"), 4)
+        self.assertEqual(token_estimate.estimate_text_tokens("hello world"), 4)
+
+    def test_empty_and_none(self):
+        self.assertEqual(token_estimate.estimate_text_tokens(""), 0)
+        self.assertEqual(token_estimate.estimate_text_tokens(None), 0)
+        # 默认带上游系统提示的补偿，所以空对话也不是 0；补偿归零才归零
+        self.assertEqual(
+            token_estimate.estimate_messages_tokens([], system_overhead=0), 0)
+        self.assertEqual(
+            token_estimate.estimate_messages_tokens(None, system_overhead=0), 0)
+
+    def test_non_string_is_stringified(self):
+        self.assertGreater(token_estimate.estimate_text_tokens(12345), 0)
+        self.assertGreater(token_estimate.estimate_text_tokens({"a": "b"}), 0)
+
+    def test_message_overhead_and_system_overhead(self):
+        one = token_estimate.estimate_messages_tokens(
+            [{"role": "user", "content": "你好"}], system_overhead=0)
+        two = token_estimate.estimate_messages_tokens(
+            [{"role": "user", "content": "你好"},
+             {"role": "assistant", "content": "你好"}], system_overhead=0)
+        # 每条 message 都有结构开销
+        self.assertEqual(two - one, token_estimate.MESSAGE_OVERHEAD + 2)
+        with_system = token_estimate.estimate_messages_tokens(
+            [{"role": "user", "content": "你好"}], system_overhead=100)
+        self.assertGreater(with_system, one)
+
+    def test_margin_biases_upward(self):
+        raw = token_estimate.estimate_text_tokens("a" * 1000)
+        total = token_estimate.estimate_messages_tokens(
+            [{"role": "user", "content": "a" * 1000}], system_overhead=0)
+        self.assertGreaterEqual(total, raw)
+
+    def test_tool_calls_echo_counted(self):
+        """agent 循环里 assistant 消息会带回 tool_calls，这部分真占 token。"""
+        base = [{"role": "user", "content": "查天气"}]
+        with_calls = base + [{
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                "name": "get_weather", "arguments": '{"city": "北京"}'}}],
+        }]
+        self.assertGreater(
+            token_estimate.estimate_messages_tokens(with_calls, "", 0),
+            token_estimate.estimate_messages_tokens(base, "", 0),
+        )
+
+    def test_content_blocks_and_images(self):
+        blocks = [{"role": "user", "content": [
+            {"type": "text", "text": "看这张图"},
+            {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+        ]}]
+        # 图片按块给固定占位值，不能按字符算成 0
+        self.assertGreaterEqual(
+            token_estimate.estimate_messages_tokens(blocks, "", 0),
+            token_estimate.BLOCK_OVERHEAD)
+
+    def test_output_tokens_includes_reasoning(self):
+        text_only = token_estimate.estimate_output_tokens("答案")
+        with_reasoning = token_estimate.estimate_output_tokens(
+            "答案", "我想一想")
+        self.assertEqual(
+            with_reasoning - text_only,
+            token_estimate.estimate_text_tokens("我想一想"))
+
+
+class UsageStatsTest(unittest.TestCase):
+    """累计统计：聚合维度、落盘往返、跳天归档与淘汰。"""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmpdir, "usage.json")
+
+    def _make(self, **kwargs):
+        return usage_stats.UsageStats(self.path, True, **kwargs)
+
+    def test_aggregates_by_model_and_account(self):
+        stats = self._make()
+        stats.record(api="openai", model="glm-4", account="账号1",
+                     prompt_tokens=100, output_tokens=20)
+        stats.record(api="anthropic", model="glm-5", account="账号2",
+                     prompt_tokens=50, output_tokens=10, reasoning_tokens=5,
+                     tool_calls=2, elapsed_ms=1200)
+        today = stats.today()
+        self.assertEqual(today["requests"], 2)
+        self.assertEqual(today["input_tokens"], 150)
+        self.assertEqual(today["output_tokens"], 30)
+        self.assertEqual(today["reasoning_tokens"], 5)
+        self.assertEqual(today["tool_calls"], 2)
+        self.assertEqual(today["by_model"]["glm-4"]["requests"], 1)
+        self.assertEqual(today["by_model"]["glm-5"]["input_tokens"], 50)
+        self.assertEqual(today["by_account"]["账号1"]["output_tokens"], 20)
+        self.assertEqual(today["by_account"]["账号2"]["tool_calls"], 2)
+
+    def test_blank_keys_are_not_dropped(self):
+        stats = self._make()
+        stats.record(api="openai", model="", account="", prompt_tokens=1)
+        self.assertIn("(未标注)", stats.today()["by_model"])
+
+    def test_snapshot_is_a_copy(self):
+        stats = self._make()
+        stats.record(api="openai", model="glm-4", prompt_tokens=10)
+        snap = stats.snapshot()
+        snap["today"]["requests"] = 999
+        self.assertEqual(stats.today()["requests"], 1)
+
+    def test_flush_and_reload_round_trip(self):
+        stats = self._make()
+        stats.record(api="openai", model="glm-4", account="账号1",
+                     prompt_tokens=100, output_tokens=20)
+        stats.flush()
+        self.assertTrue(os.path.exists(self.path))
+
+        reloaded = self._make()
+        today = reloaded.today()
+        # 当天那部分必须接回来，否则重启一次今天的累计就归零
+        self.assertEqual(today["requests"], 1)
+        self.assertEqual(today["input_tokens"], 100)
+        self.assertEqual(today["by_account"]["账号1"]["output_tokens"], 20)
+
+    def test_flush_interval_throttles_disk_writes(self):
+        stats = self._make(flush_interval=3600)
+        # 第一次立即落盘：否则进程被硬杀时这段时间内的数据全丢
+        stats.record(api="openai", model="glm-4", prompt_tokens=10)
+        self.assertTrue(os.path.exists(self.path))
+
+        # 间隔内的第二次只改内存，盘上还是旧值
+        stats.record(api="openai", model="glm-4", prompt_tokens=20)
+        with open(self.path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["days"][stats._day]["input_tokens"], 10)
+
+        stats.flush()                                    # 退出时兜一次
+        with open(self.path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["days"][stats._day]["input_tokens"], 30)
+
+    def test_corrupt_file_does_not_explode(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{ not json")
+        stats = self._make()
+        stats.record(api="openai", model="glm-4", prompt_tokens=1)
+        self.assertEqual(stats.today()["requests"], 1)
+
+    def test_cross_day_archives_and_prunes(self):
+        stats = self._make(keep_days=2)
+        stats.record(api="openai", model="glm-4", prompt_tokens=10)
+
+        real_today = usage_stats._today
+        usage_stats._today = lambda: "2026-01-01"
+        try:
+            stats.record(api="openai", model="glm-4", prompt_tokens=20)
+            # 跳天：旧一天被归档，新一天从零开始
+            self.assertEqual(stats.today()["requests"], 1)
+            self.assertEqual(stats.today()["input_tokens"], 20)
+            self.assertIn(real_today(), stats.snapshot()["days"])
+
+            usage_stats._today = lambda: "2026-01-02"
+            stats.record(api="openai", model="glm-4", prompt_tokens=30)
+            usage_stats._today = lambda: "2026-01-03"
+            stats.record(api="openai", model="glm-4", prompt_tokens=40)
+            days = stats.snapshot()["days"]
+            # keep_days=2：按日期排序舍最早的 2026-01-01；
+            # 真实今天（2026-10-09）日期最新，该留
+            self.assertNotIn("2026-01-01", days)
+            self.assertEqual(sorted(days), ["2026-01-02", real_today()])
+            self.assertEqual(len(days), 2)
+        finally:
+            usage_stats._today = real_today
+
+    def test_disabled_never_touches_disk(self):
+        stats = usage_stats.UsageStats(self.path, False)
+        stats.record(api="openai", model="glm-4", prompt_tokens=10)
+        stats.flush()
+        self.assertFalse(os.path.exists(self.path))
+
+
+class UsageEndToEndTest(HttpEndToEndTest):
+    """usage 出口：非流式真数据、流式 include_usage 尾帧、/v1/usage、count_tokens。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 关落落盘，只验证行为；UsageStats 的持久化由 UsageStatsTest 覆盖
+        self.config.usage_stats = None
+
+    def test_non_stream_usage_is_estimated(self):
+        status, data = self.post_json(
+            {"model": "glm-4", "messages": [BUSY_REQUEST]})
+        self.assertEqual(status, 200)
+        usage = data["usage"]
+        self.assertGreater(usage["prompt_tokens"], 0)
+        self.assertGreater(usage["completion_tokens"], 0)
+        self.assertEqual(usage["total_tokens"],
+                         usage["prompt_tokens"] + usage["completion_tokens"])
+
+    def test_stream_without_include_usage_has_no_usage_field(self):
+        raw = self.post_raw({"model": "glm-4", "stream": True,
+                             "messages": [BUSY_REQUEST]})
+        self.assertNotIn('"usage"', raw)
+
+    def test_stream_with_include_usage_emits_trailing_chunk(self):
+        raw = self.post_raw({
+            "model": "glm-4", "stream": True, "messages": [BUSY_REQUEST],
+            "stream_options": {"include_usage": True},
+        })
+        chunks = [
+            json.loads(line[6:]) for line in raw.splitlines()
+            if line.startswith("data: ") and line[6:].strip() != "[DONE]"
+        ]
+        usage_chunks = [c for c in chunks if "usage" in c]
+        self.assertEqual(len(usage_chunks), 1)
+        # OpenAI 约定：usage 帧在最后，choices 为空数组
+        self.assertEqual(usage_chunks[0]["choices"], [])
+        self.assertEqual(chunks[-1], usage_chunks[0])
+        usage = usage_chunks[0]["usage"]
+        self.assertGreater(usage["prompt_tokens"], 0)
+        self.assertEqual(usage["total_tokens"],
+                         usage["prompt_tokens"] + usage["completion_tokens"])
+
+    def test_usage_endpoint(self):
+        stats = usage_stats.UsageStats("", False)
+        self.config.usage_stats = stats
+        req = urllib.request.Request(
+            self.base + "/v1/usage", headers={"Authorization": "Bearer secret"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        self.assertTrue(data["enabled"])
+        self.assertTrue(data["estimated"])
+        self.assertEqual(data["today"]["requests"], 0)
+
+    def test_count_tokens_endpoint(self):
+        req = urllib.request.Request(
+            self.base + "/v1/messages/count_tokens",
+            data=json.dumps({"model": "glm-4",
+                             "messages": [{"role": "user", "content": "你好世界"}]}).encode(),
+            headers={"Content-Type": "application/json",
+                     "x-api-key": "secret"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        self.assertGreater(data["input_tokens"], 0)
 
 
 if __name__ == "__main__":

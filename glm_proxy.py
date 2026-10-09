@@ -11,6 +11,8 @@ chatglm.cn 最小反代 —— 把智谱清言网页版接口暴露成 OpenAI �
     * 撞闸退避重试：识别并发闸/限流类业务错误与 429/5xx，指数退避后重试
     * 多账号：GLM_REFRESH_TOKENS 逗号分隔，账号间可并行、失效自动轮换
     * refresh_token 落盘：上游轮换后的 token 写入 .glm_tokens.json，重启不再用回旧值
+    * 用量统计：usage / count_tokens 走本地估算（上游不返回计数字段），
+      累计值按天聚合落盘到 .glm_usage.json，GET /v1/usage 可查
 
 签名算法逆向自智谱清言桌面客户端 resources/app.asar 的 src/main/auth-headers.js：
     X-Timestamp: 毫秒时间戳，把「倒数第 2 位」替换为 (各位数字之和 - 倒数第 2 位) % 10
@@ -26,6 +28,7 @@ chatglm.cn 最小反代 —— 把智谱清言网页版接口暴露成 OpenAI �
 from __future__ import annotations
 
 import argparse
+import atexit
 import codecs
 import gzip
 import hashlib
@@ -45,6 +48,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # 以 `python glm_proxy.py` 运行时本模块名是 __main__，再 import 会拿到第二份模块副本，
 # 异常类身份不一致会让 except 全部失效，所以需要的少量对象由 Handler 显式注入。
 import anthropic_api
+# token 估算与用量统计。上游网页版接口不返回任何计数字段，usage 全是本地估算值
+# （详见 token_estimate 模块 docstring），累计值按天聚合落盘（usage_stats）。
+import token_estimate
+import usage_stats
 
 # ─────────────────────────── 常量 ───────────────────────────
 # 与桌面客户端 auth-headers.js 中的 SIGN_SECRET_PROD 完全一致
@@ -66,6 +73,8 @@ EXPOSED_MODELS = [
 ]
 ACCESS_TOKEN_TTL = 3600
 DEFAULT_TOKEN_FILE = ".glm_tokens.json"
+# 用量累计统计的落盘文件（与 .glm_tokens.json 同目录同待遇，已在 .gitignore 忽略）
+DEFAULT_USAGE_FILE = ".glm_usage.json"
 
 # 上游并发闸/限流的业务文案特征。命中即认定「同一账号同时只能有一个生成」，
 # 走退避重试而不是直接把 502 甩给客户端。
@@ -264,6 +273,20 @@ class Config:
         raw_tools_budget = os.environ.get("GLM_TOOLS_PROMPT_MAX_CHARS", "").strip()
         self.tools_prompt_max_chars = (int(raw_tools_budget) if raw_tools_budget
                                        else TOOLS_PROMPT_MAX_CHARS)
+
+        # ── token 估算与用量统计 ──
+        # 上游不返回任何计数字段，usage 只能本地估算（token_estimate），偏差取向是
+        # 「宁可高估」：估低了客户端不压缩上下文，会一路捅到上游 context 上限。
+        # 上游自己注入的系统提示客户端看不到也估算不到，用这个常量补偿。
+        self.system_prompt_overhead = int(
+            os.environ.get("GLM_SYSTEM_PROMPT_OVERHEAD", "") or token_estimate.DEFAULT_SYSTEM_OVERHEAD)
+        # 累计统计按天聚合后落盘；测试里把 usage_stats 置 None 即完全关闭
+        self.usage_file = (os.environ.get("GLM_USAGE_FILE", DEFAULT_USAGE_FILE).strip()
+                           or DEFAULT_USAGE_FILE)
+        self.persist_usage = env_bool("GLM_PERSIST_USAGE", True)
+        self.usage_flush_seconds = float(os.environ.get("GLM_USAGE_FLUSH", "") or 60)
+        self.usage_keep_days = int(os.environ.get("GLM_USAGE_KEEP_DAYS", "") or 7)
+        self.usage_stats = None
 
     @property
     def use_guest(self) -> bool:
@@ -2383,6 +2406,8 @@ class Handler(BaseHTTPRequestHandler):
     _served_model: str = ""     # 上游实际返回的模型（如 moe_53f），用于日志与 system_fingerprint
     _sse_open = False           # SSE 响应头是否已发出（发出后就不能再改状态码，只能补收尾帧）
     _sse_emit = None            # 当前 SSE 流的 emit(delta, finish_reason)，仅 OpenAI 路径
+    _sse_usage = None           # 当前 SSE 流的 usage 尾帧出口（stream_options.include_usage）
+    _usage_ctx = None           # 当前请求的记账上下文（模型/账号/流式/起始时间）
 
     def log_message(self, fmt, *args):  # 静音默认访问日志
         if self.config and self.config.verbose:
@@ -2450,6 +2475,13 @@ class Handler(BaseHTTPRequestHandler):
                     for m in self.config.models
                 ],
             })
+        if route.startswith("/v1/usage"):
+            if not self._authorized():
+                return self._error(401, "无效的 API Key", "authentication_error")
+            stats = getattr(self.config, "usage_stats", None)
+            if stats is None:
+                return self._json(200, {"enabled": False, "estimated": True})
+            return self._json(200, {"enabled": True, **stats.snapshot()})
         self._error(404, f"未知路径: {self.path}", "not_found")
 
     def do_POST(self):
@@ -2477,6 +2509,10 @@ class Handler(BaseHTTPRequestHandler):
         model = str(payload.get("model", "glm-4"))
         self._served_model = ""   # 每个请求独立，避免 keep-alive 复用实例时串味
         want_stream = bool(payload.get("stream"))
+        # OpenAI 约定：只有显式要了 stream_options.include_usage 才在流尾补 usage 帧，
+        # 否则一个 usage 都不发（老客户端可能被多出来的字段搅乱）
+        include_usage = bool(
+            (payload.get("stream_options") or {}).get("include_usage"))
         networking = extract_networking(payload, self.config.networking)
         # 深度思考：单次请求可覆盖全局默认（GLM_DEEP_THINKING），见 extract_deep_thinking
         deep_thinking = extract_deep_thinking(payload, self.config.deep_thinking)
@@ -2488,6 +2524,10 @@ class Handler(BaseHTTPRequestHandler):
         tools = tool_defs if self.config.prompt_tool_calling else []
         tools_instructions = (render_tools_prompt(tools, self.config.tools_prompt_max_chars)
                               if tools else "")
+        # 输入 token 估算：对话本体 + 工具定义渲染 + 上游自注入系统提示的补偿。
+        # 一次请求只用算一遍，后面流式/非流式/工具三条出口都复用它。
+        prompt_tokens = token_estimate.estimate_messages_tokens(
+            messages, tools_instructions, self.config.system_prompt_overhead)
         if tool_defs and not tools:
             log(f"[compat] 请求带 {len(tool_defs)} 个工具定义，但 GLM_PROMPT_TOOL_CALLING=false，已忽略")
         elif tools:
@@ -2528,17 +2568,28 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._error(502, f"上游请求失败: {exc}", "upstream_error")
 
+        # 记账上下文：三个出口（流式/非流式/工具）都从这里取模型、账号、起始时间
+        self._usage_ctx = {
+            "api": "openai", "model": model, "stream": want_stream,
+            "account": lease.account.name if lease.account is not None else "",
+            "prompt_tokens": prompt_tokens, "include_usage": include_usage,
+            "started": time.time(),
+        }
+
         try:
             if tools:
                 self._tool_aware_response(
                     resp, model, want_stream, tools, lease.account, assistant_id,
                     messages=messages, networking=networking,
                     tools_instructions=tools_instructions,
-                    release_lease=lease.release, deep_thinking=deep_thinking)
+                    release_lease=lease.release, deep_thinking=deep_thinking,
+                    prompt_tokens=prompt_tokens)
             elif want_stream:
-                self._stream_response(resp, model, lease.account, assistant_id)
+                self._stream_response(resp, model, lease.account, assistant_id,
+                                      prompt_tokens=prompt_tokens)
             else:
-                self._blocking_response(resp, model, lease.account, assistant_id)
+                self._blocking_response(resp, model, lease.account, assistant_id,
+                                        prompt_tokens=prompt_tokens)
         except (BrokenPipeError, ConnectionResetError):
             log("[http] 客户端提前断开")
         except Exception as exc:
@@ -2554,8 +2605,13 @@ class Handler(BaseHTTPRequestHandler):
             lease.release()  # 关键：流读完才把账号槽位还回去
 
     # ── 响应体 ──
-    def _begin_sse_stream(self, model: str):
-        """发 SSE 响应头，返回 emit(delta, finish_reason) 出口。"""
+    def _begin_sse_stream(self, model: str, include_usage: bool = False):
+        """发 SSE 响应头，返回 emit(delta, finish_reason) 出口。
+
+        ``include_usage`` 为真时额外装配一个 usage 尾帧出口（``self._sse_usage``），
+        由 ``_finish_sse`` 在 ``[DONE]`` 之前发出 —— 这是 OpenAI 的约定位置：
+        最后一个 chunk 的 ``choices`` 为空、只带 ``usage``。
+        """
         conv_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
 
@@ -2577,9 +2633,25 @@ class Handler(BaseHTTPRequestHandler):
                 chunk["system_fingerprint"] = self._served_model
             self._chunk(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
 
+        def emit_usage(usage: dict) -> None:
+            chunk = {
+                "id": conv_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [], "usage": usage,
+            }
+            self._chunk(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+
         self._sse_open = True
         self._sse_emit = emit
+        self._sse_usage = emit_usage if include_usage else None
         return emit
+
+    def _finish_sse(self, usage: dict = None) -> None:
+        """SSE 收尾：按需补 usage 尾帧，再发 ``[DONE]`` 并结束分块编码。"""
+        if self._sse_usage is not None and usage is not None:
+            self._sse_usage(usage)
+        self._chunk(b"data: [DONE]\n\n")
+        self._end_chunks()
 
     def _abort_stream(self) -> bool:
         """SSE 头已发出之后才出错：补一帧收尾，别让客户端挂在没有结束的流上。
@@ -2594,8 +2666,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self._sse_emit is not None:
                 self._sse_emit({}, "stop")
-                self._chunk(b"data: [DONE]\n\n")
-            self._end_chunks()
+                # 中断时输出为 0，但输入已经烧掉了，usage 照发（客户端要拿它记账）
+                usage = usage_stats.openai_usage(
+                    (self._usage_ctx or {}).get("prompt_tokens", 0), "", "")
+                self._finish_sse(usage)
         except Exception:               # 收尾写不出去（客户端已断开）只能作罢
             pass
         return True
@@ -2622,8 +2696,12 @@ class Handler(BaseHTTPRequestHandler):
         return acc
 
     def _completion_payload(self, acc: "StreamAccumulator", model: str,
-                            text_override: str = None) -> dict:
+                            text_override: str = None, prompt_tokens: int = 0,
+                            usage: dict = None) -> dict:
         text = acc.full_text() if text_override is None else text_override
+        if usage is None:
+            usage = usage_stats.openai_usage(
+                prompt_tokens, text, acc.full_reasoning())
         return {
             "id": acc.conversation_id or f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -2639,11 +2717,16 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 "finish_reason": "stop",
             }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "usage": usage,
         }
 
     def _tool_calls_payload(self, calls: list, model: str, conv_id: str = "",
-                            fingerprint: str = "") -> dict:
+                            fingerprint: str = "", prompt_tokens: int = 0,
+                            usage: dict = None) -> dict:
+        if usage is None:
+            # 工具调用的参数同样是模型生成的内容，按序列化后的体积算
+            usage = usage_stats.openai_usage(
+                prompt_tokens, json.dumps(calls, ensure_ascii=False))
         return {
             "id": conv_id or f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -2655,12 +2738,49 @@ class Handler(BaseHTTPRequestHandler):
                 "message": {"role": "assistant", "content": None, "tool_calls": calls},
                 "finish_reason": "tool_calls",
             }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "usage": usage,
         }
 
+    # ── 记账 ──
+    def _record_usage(self, usage: dict, text: str = "", reasoning: str = "",
+                      tool_calls: int = 0) -> None:
+        """把一次请求的用量记进累计统计，并打一行日志。
+
+        usage 已经是估算好的最终值（响应体里发出去的那一份），这里只做汇总，
+        不重复计算 —— 保证「日志里看到的」和「客户端收到的」永远一致。
+        """
+        ctx = self._usage_ctx or {}
+        started = ctx.get("started") or time.time()
+        usage_stats.record_request(
+            getattr(self.config, "usage_stats", None),
+            api=ctx.get("api", "openai"),
+            model=ctx.get("model", ""),
+            account=ctx.get("account", ""),
+            served_model=self._served_model,
+            stream=bool(ctx.get("stream")),
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            output_tokens=usage.get("completion_tokens", 0),
+            reasoning_tokens=token_estimate.estimate_text_tokens(reasoning),
+            tool_calls=tool_calls,
+            elapsed=time.time() - started,
+            log=log,
+        )
+
+    def _finish_completion(self, acc: "StreamAccumulator", model: str,
+                           text_override: str = None, prompt_tokens: int = 0) -> None:
+        """非流式出口：算 usage → 发响应 → 记账，三步共用一份数字。"""
+        text = acc.full_text() if text_override is None else text_override
+        reasoning = acc.full_reasoning()
+        usage = usage_stats.openai_usage(prompt_tokens, text, reasoning)
+        self._json(200, self._completion_payload(
+            acc, model, text_override=text_override,
+            prompt_tokens=prompt_tokens, usage=usage))
+        self._record_usage(usage, text=text, reasoning=reasoning)
+
     def _stream_response(self, resp, model: str, account: "Account" = None,
-                         assistant_id: str = "") -> None:
-        emit = self._begin_sse_stream(model)
+                         assistant_id: str = "", prompt_tokens: int = 0) -> None:
+        emit = self._begin_sse_stream(
+            model, include_usage=bool((self._usage_ctx or {}).get("include_usage")))
         acc = StreamAccumulator()
 
         role_sent = False
@@ -2687,8 +2807,11 @@ class Handler(BaseHTTPRequestHandler):
             if not role_sent:
                 emit({"role": "assistant", "content": ""})
             emit({}, "stop")
-            self._chunk(b"data: [DONE]\n\n")
-            self._end_chunks()
+            usage = usage_stats.openai_usage(
+                prompt_tokens, acc.full_text(), acc.full_reasoning())
+            self._finish_sse(usage)
+            self._record_usage(usage, text=acc.full_text(),
+                               reasoning=acc.full_reasoning())
         finally:
             self._log_served_model()
             if acc.conversation_id:
@@ -2703,10 +2826,10 @@ class Handler(BaseHTTPRequestHandler):
             log(f"[upstream] 实际模型 = {self._served_model}")
 
     def _blocking_response(self, resp, model: str, account: "Account" = None,
-                           assistant_id: str = "") -> None:
+                           assistant_id: str = "", prompt_tokens: int = 0) -> None:
         acc = self._consume_all(resp)
         self._served_model = acc.served_model
-        self._json(200, self._completion_payload(acc, model))
+        self._finish_completion(acc, model, prompt_tokens=prompt_tokens)
         self._log_served_model()
         if acc.conversation_id:
             threading.Thread(
@@ -2721,7 +2844,8 @@ class Handler(BaseHTTPRequestHandler):
                              networking: bool = False,
                              tools_instructions: str = "",
                              release_lease=None,
-                             deep_thinking: bool = False) -> None:
+                             deep_thinking: bool = False,
+                             prompt_tokens: int = 0) -> None:
         """先缓冲正文，再决定回「工具调用」还是「普通回答」。
 
         必须缓冲**正文**：只有拿到完整输出才知道模型是在调用工具还是在正常说话。
@@ -2738,7 +2862,9 @@ class Handler(BaseHTTPRequestHandler):
 
         # 流式请求：SSE 头先发出去，思维链增量随到随发（正文仍整段缓冲）。
         # 续问时这条流继续复用——客户端先看到第一轮思维链，再看到续问后的思维链与正文。
-        emit = self._begin_sse_stream(model) if want_stream else None
+        emit = (self._begin_sse_stream(
+            model, include_usage=bool((self._usage_ctx or {}).get("include_usage")))
+            if want_stream else None)
         reasoning_streamed = False
 
         def stream_reasoning(delta: str) -> None:
@@ -2856,16 +2982,28 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if calls:
                 log(f"[tools] 模型请求调用 {[c['function']['name'] for c in calls]}")
+                usage = usage_stats.openai_usage(
+                    prompt_tokens, json.dumps(calls, ensure_ascii=False))
                 if want_stream:
-                    self._stream_tool_calls(calls, model, emit)
+                    self._stream_tool_calls(calls, model, emit, usage=usage)
                 else:
                     self._json(200, self._tool_calls_payload(
-                        calls, model, acc.conversation_id, acc.served_model))
+                        calls, model, acc.conversation_id, acc.served_model,
+                        prompt_tokens=prompt_tokens, usage=usage))
+                self._record_usage(
+                    usage, text=json.dumps(calls, ensure_ascii=False),
+                    tool_calls=len(calls))
             elif want_stream:
+                usage = usage_stats.openai_usage(
+                    prompt_tokens, text, acc.full_reasoning())
                 self._stream_plain_text(text, acc.full_reasoning(), model, emit,
-                                        reasoning_streamed=reasoning_streamed)
+                                        reasoning_streamed=reasoning_streamed,
+                                        usage=usage)
+                self._record_usage(usage, text=text,
+                                   reasoning=acc.full_reasoning())
             else:
-                self._json(200, self._completion_payload(acc, model, text_override=text))
+                self._finish_completion(acc, model, text_override=text,
+                                        prompt_tokens=prompt_tokens)
         finally:
             if acc.conversation_id:
                 threading.Thread(
@@ -2978,7 +3116,8 @@ class Handler(BaseHTTPRequestHandler):
             log(f"[tools][诊断] 思维链开头：{head!r}")
 
     def _stream_plain_text(self, text: str, reasoning: str, model: str, emit=None,
-                           reasoning_streamed: bool = False) -> None:
+                           reasoning_streamed: bool = False,
+                           usage: dict = None) -> None:
         """工具模式下没触发工具调用时，把缓冲好的整段文本按 SSE 一次性吐出去。
 
         ``emit`` 由调用方传入（思维链已经在用同一条流增量发出），``reasoning_streamed``
@@ -2990,10 +3129,10 @@ class Handler(BaseHTTPRequestHandler):
             emit({"role": "assistant", "content": None, "reasoning_content": reasoning})
         emit({"role": "assistant", "content": text})
         emit({}, "stop")
-        self._chunk(b"data: [DONE]\n\n")
-        self._end_chunks()
+        self._finish_sse(usage)
 
-    def _stream_tool_calls(self, calls: list, model: str, emit=None) -> None:
+    def _stream_tool_calls(self, calls: list, model: str, emit=None,
+                           usage: dict = None) -> None:
         emit = emit or self._begin_sse_stream(model)
         for index, call in enumerate(calls):
             delta_call = {
@@ -3007,8 +3146,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 emit({"tool_calls": [delta_call]})
         emit({}, "tool_calls")
-        self._chunk(b"data: [DONE]\n\n")
-        self._end_chunks()
+        self._finish_sse(usage)
 
 
 # ─────────────────────────── 启动 ───────────────────────────
@@ -3079,6 +3217,12 @@ def main() -> int:
     pool = AccountPool(config, accounts)
     Handler.config = config
     Handler.client = GLMClient(config, pool)
+    # 用量累计统计（估算值）。enabled=False 时退化为纯内存对象，不碰磁盘
+    config.usage_stats = usage_stats.UsageStats(
+        config.usage_file, config.persist_usage,
+        config.usage_flush_seconds, config.usage_keep_days)
+    # 退出时兜一次落盘：否则最后一个 flush 间隔内的数据会丢
+    atexit.register(config.usage_stats.flush)
 
     mode = "游客模式" if all(a.is_guest for a in accounts) else f"账号模式（{len(accounts)} 个账号）"
 
@@ -3107,6 +3251,12 @@ def main() -> int:
         log("联网搜索：默认开启")
     if config.persist_tokens:
         log(f"refresh_token 落盘：{config.token_file}（GLM_PERSIST_TOKENS=false 可关闭）")
+    if config.persist_usage:
+        log(f"用量统计（本地估算，非上游精确计数）：{config.usage_file}"
+            f"｜每 {config.usage_flush_seconds:.0f}s 落盘、保留 {config.usage_keep_days} 天"
+            f"｜GET /v1/usage 查看（GLM_PERSIST_USAGE=false 关闭）")
+    else:
+        log("用量统计：未落盘（GLM_PERSIST_USAGE=true 可开启；usage 仍是本地估算值）")
     log(f"OpenAI 兼容地址: http://{config.host}:{config.port}/v1")
     if _LOG_SINKS:
         log(f"日志文件（UTF-8）：{os.path.abspath(_LOG_SINKS[0])}")

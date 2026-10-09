@@ -34,8 +34,9 @@ import threading
 import time
 import uuid
 
-# 与 glm_proxy 保持一致的粗略估算：中文场景下 1 token ≈ 2~4 字节，取保守值。
-_CHARS_PER_TOKEN = 3
+# token 估算与用量统计：上游网页版接口不返回任何计数字段，usage 全是本地估算值
+import token_estimate
+import usage_stats
 
 
 # ─────────────────────────── 入口 ───────────────────────────
@@ -65,13 +66,15 @@ def handle_messages(handler, glm) -> None:
     tools_instructions = (glm.render_tools_prompt(tools, handler.config.tools_prompt_max_chars)
                           if tools else "")
     assistant_id = handler.config.model_assistant_map.get(model.lower(), "")
-    input_tokens = estimate_input_tokens(openai_messages, tools_instructions)
+    input_tokens = token_estimate.estimate_messages_tokens(
+        openai_messages, tools_instructions, handler.config.system_prompt_overhead)
     networking = _networking(payload, handler.config.networking)
+    started = time.time()
 
     if handler.config.verbose:
         glm.log(f"[anthropic] model={model} stream={stream} msgs={len(messages)} "
                 f"tools={len(tools)} thinking={want_thinking} "
-                f"deep_thinking={deep_thinking}")
+                f"deep_thinking={deep_thinking} input_tokens≈{input_tokens}")
 
     try:
         lease, resp = handler.client.open_stream(
@@ -92,14 +95,16 @@ def handle_messages(handler, glm) -> None:
             # 工具模式（判断是不是工具调用）与 stop_sequences（本地截断）都必须先拿到完整输出
             acc = _consume_all(glm, resp)
             _render_buffered(handler, glm, acc, model, stream, tools, want_thinking,
-                             input_tokens, lease.account, assistant_id, stop_sequences)
+                             input_tokens, lease.account, assistant_id, stop_sequences,
+                             started=started)
         elif stream:
             _render_stream(handler, glm, resp, model, want_thinking, input_tokens,
-                           lease.account, assistant_id)
+                           lease.account, assistant_id, started=started)
         else:
             acc = _consume_all(glm, resp)
             _render_buffered(handler, glm, acc, model, False, [], want_thinking,
-                             input_tokens, lease.account, assistant_id, stop_sequences)
+                             input_tokens, lease.account, assistant_id, stop_sequences,
+                             started=started)
     except (BrokenPipeError, ConnectionResetError):
         glm.log("[http] 客户端提前断开")
     except Exception as exc:
@@ -126,7 +131,8 @@ def handle_count_tokens(handler, glm) -> None:
     tools = normalize_tools(payload.get("tools"))
     openai_messages = to_openai_messages(payload.get("system"), payload["messages"])
     extra = glm.render_tools_prompt(tools, handler.config.tools_prompt_max_chars) if tools else ""
-    handler._json(200, {"input_tokens": estimate_input_tokens(openai_messages, extra)})
+    handler._json(200, {"input_tokens": token_estimate.estimate_messages_tokens(
+        openai_messages, extra, handler.config.system_prompt_overhead)})
 
 
 def authorized(handler) -> bool:
@@ -328,7 +334,8 @@ def _consume_all(glm, resp):
 
 def _render_buffered(handler, glm, acc, model, stream: bool, tools: list,
                      want_thinking: bool, input_tokens: int, account, assistant_id: str,
-                     stop_sequences: list | None = None) -> None:
+                     stop_sequences: list | None = None,
+                     started: float = 0.0) -> None:
     """把缓冲好的完整输出渲染成 Anthropic message —— 工具结果或普通回答都走这里。"""
     text = glm.join_answer_parts(
         acc.part_texts(), handler.config.strip_process_narration)
@@ -369,7 +376,10 @@ def _render_buffered(handler, glm, acc, model, stream: bool, tools: list,
             glm.log(f"[anthropic] 命中 stop_sequences，已在本地截断（{stop_sequence!r}）")
         blocks.append({"type": "text", "text": text})
 
-    output_tokens = estimate_tokens(text)
+    # 输出 token：正文 + 思维链都是模型生成的内容，一起算。
+    # 工具调用时 text 是原始调用文本（同样被生成过），照算。
+    output_tokens = token_estimate.estimate_output_tokens(text, reasoning)
+    reasoning_tokens = token_estimate.estimate_text_tokens(reasoning)
     message_id = _new_message_id()
 
     if not stream:
@@ -404,10 +414,21 @@ def _render_buffered(handler, glm, acc, model, stream: bool, tools: list,
         handler._end_chunks()
 
     _delete_conversation(glm, handler, acc, account, assistant_id)
+    usage_stats.record_request(
+        getattr(handler.config, "usage_stats", None),
+        api="anthropic", model=model,
+        account=getattr(account, "name", "") or "",
+        served_model=getattr(acc, "served_model", "") or "",
+        stream=stream, prompt_tokens=input_tokens, output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens, tool_calls=len(calls or []),
+        elapsed=time.time() - started if started else 0.0,
+        log=glm.log,
+    )
 
 
 def _render_stream(handler, glm, resp, model: str, want_thinking: bool,
-                   input_tokens: int, account, assistant_id: str) -> None:
+                   input_tokens: int, account, assistant_id: str,
+                   started: float = 0.0) -> None:
     """无工具的逐字流式：上游 delta 直接映射成 text/thinking block 的增量事件。"""
     message_id = _new_message_id()
     emit = _begin_stream(handler, message_id, model, input_tokens)
@@ -463,15 +484,30 @@ def _render_stream(handler, glm, resp, model: str, want_thinking: bool,
         else:
             emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
 
+        reasoning = acc.full_reasoning() if want_thinking else ""
         emit("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-            "usage": {"output_tokens": estimate_tokens(acc.full_text())},
+            "usage": {"output_tokens": token_estimate.estimate_output_tokens(
+                acc.full_text(), reasoning)},
         })
         emit("message_stop", {"type": "message_stop"})
         handler._end_chunks()
     finally:
         _delete_conversation(glm, handler, acc, account, assistant_id)
+        usage_stats.record_request(
+            getattr(handler.config, "usage_stats", None),
+            api="anthropic", model=model,
+            account=getattr(account, "name", "") or "",
+            served_model=getattr(acc, "served_model", "") or "",
+            stream=True, prompt_tokens=input_tokens,
+            output_tokens=token_estimate.estimate_output_tokens(
+                acc.full_text(), acc.full_reasoning() if want_thinking else ""),
+            reasoning_tokens=token_estimate.estimate_text_tokens(
+                acc.full_reasoning() if want_thinking else ""),
+            elapsed=time.time() - started if started else 0.0,
+            log=glm.log,
+        )
 
 
 def _close_thinking(emit, think_index, think_closed: bool) -> bool:
@@ -556,15 +592,14 @@ def _delete_conversation(glm, handler, acc, account, assistant_id: str) -> None:
 
 # ─────────────────────────── 工具函数 ───────────────────────────
 def estimate_tokens(text: str) -> int:
-    return max(1, len(text or "") // _CHARS_PER_TOKEN)
+    """估算一段文本的 token 数（内部统一走 token_estimate）。"""
+    return token_estimate.estimate_text_tokens(text)
 
 
-def estimate_input_tokens(messages: list, extra: str = "") -> int:
-    try:
-        blob = json.dumps(messages, ensure_ascii=False) + (extra or "")
-    except (TypeError, ValueError):
-        blob = str(messages)
-    return estimate_tokens(blob)
+def estimate_input_tokens(messages: list, extra: str = "",
+                          system_overhead: int = 0) -> int:
+    """估算整段对话的输入 token 数（内部统一走 token_estimate）。"""
+    return token_estimate.estimate_messages_tokens(messages, extra, system_overhead)
 
 
 def _new_message_id() -> str:
